@@ -1,0 +1,294 @@
+---
+source: tests/integration_tests/help.rs
+info:
+  program: wt
+  args:
+    - switch
+    - "--help"
+  env:
+    CLICOLOR_FORCE: "1"
+    COLUMNS: "500"
+    GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
+    LANG: C
+    LC_ALL: C
+    LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
+    TERM: alacritty
+    WORKTRUNK_APPROVALS_PATH: "[TEST_APPROVALS]"
+    WORKTRUNK_CONFIG_PATH: "[TEST_CONFIG]"
+    WORKTRUNK_SYSTEM_CONFIG_PATH: "[TEST_SYSTEM_CONFIG]"
+    WORKTRUNK_TEST_BASH_INSTALLED: "0"
+    WORKTRUNK_TEST_CLAUDE_INSTALLED: "0"
+    WORKTRUNK_TEST_CODEX_INSTALLED: "0"
+    WORKTRUNK_TEST_DELAYED_STREAM_MS: "-1"
+    WORKTRUNK_TEST_EPOCH: "1735776000"
+    WORKTRUNK_TEST_FISH_INSTALLED: "0"
+    WORKTRUNK_TEST_GEMINI_INSTALLED: "0"
+    WORKTRUNK_TEST_NUSHELL_ENV: "0"
+    WORKTRUNK_TEST_OPENCODE_INSTALLED: "0"
+    WORKTRUNK_TEST_PARENT_SHELL: ""
+    WORKTRUNK_TEST_POWERSHELL_ENV: "0"
+    WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
+    WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
+    WORKTRUNK_TEST_ZSH_INSTALLED: "0"
+---
+success: true
+exit_code: 0
+----- stdout -----
+wt switch - Switch to a worktree; create if needed
+
+Usage: [1m[36mwt switch[0m [36m[OPTIONS][0m [36m[BRANCH][0m [1m[36m[--[0m [36m<EXECUTE_ARGS>...[0m[1m[36m][0m
+
+[1m[32mArguments:[0m
+  [36m[BRANCH][0m
+          Branch, worktree path, shortcut, or PR/MR URL[0m
+          
+          Opens interactive picker if omitted. Shortcuts: [1m^[0m (default branch), [1m-[0m (previous), [1m@[0m (current), [1mpr:{N}[0m (GitHub PR), [1mmr:{N}[0m (GitLab MR)[0m
+
+  [36m[EXECUTE_ARGS]...[0m
+          Additional arguments for --execute command (after --)[0m
+          
+          Each argument is expanded for templates and passed directly to the program.[0m
+
+[1m[32mOptions:[0m
+  [1m[36m-c[0m, [1m[36m--create[0m
+          Create a new branch
+
+  [1m[36m-b[0m, [1m[36m--base[0m[36m [0m[36m<BASE>[0m
+          Base branch[0m
+          
+          Defaults to default branch. Supports the same shortcuts as the branch argument: [1m^[0m, [1m@[0m, [1m-[0m, [1mpr:{N}[0m, [1mmr:{N}[0m.[0m
+
+      [1m[36m--path[0m[36m [0m[36m<PATH>[0m
+          Worktree directory for a new worktree [experimental][0m
+          
+          Overrides the [1mworktree-path[0m template for this worktree. Relative paths resolve from the current directory, as with [1mgit worktree add[0m. The branch keeps its own name; afterwards, switch by branch or by path.[0m
+
+  [1m[36m-x[0m, [1m[36m--execute[0m[36m [0m[36m<EXECUTE>[0m
+          Program to run after switch[0m
+          
+          Runs one external program after switching, with full terminal control. Arguments after [1m--[0m go directly to that program without Worktrunk shell parsing. Program lookup and argument decoding follow the operating system. Shell syntax requires an explicit shell, for example [1m-x sh -- -c 'npm install && npm test'[0m. On Windows, shell shims need their extension ([1m-x code.cmd[0m) or an explicit shell such as [1m-x cmd.exe -- /C code[0m.[0m
+          
+          Without a branch argument, the interactive picker opens and the command runs against the selected worktree — so [1mwt switch -x claude[0m picks a worktree, then launches Claude Code there.[0m
+          
+          The program starts in the worktree the switch selected, whether or not your shell follows it there: [1m--no-cd[0m governs only the shell.[0m
+          
+          Supports ]8;;https://worktrunk.dev/hook/#template-variables\[4mhook template variables]8;;\[0m ([1m{{ branch }}[0m, [1m{{ worktree_path }}[0m, etc.) and filters. [1m{{ base }}[0m and [1m{{ base_worktree_path }}[0m describe the source: the selected base with [1m--create[0m, or the invoking worktree when switching to an existing worktree.[0m
+          
+          A variable inside a shell body is substituted before that shell parses it, so a path with spaces splits into several arguments. Pass it as a separate argument instead — [1msh[0m binds the first one to [1m$0[0m, so the path arrives as [1m$1[0m:[0m
+          
+            [1m[1mwt switch feature -x sh -- -c 'cd "$1" && npm test' sh '{{ worktree_path }}'[0m
+          [0m
+          Especially useful with shell aliases:[0m
+          
+            [1m[1malias wsc='wt switch --create -x claude'[0m
+            [1mwsc feature-branch -- 'Fix GH #322'[0m
+          [0m
+          Then [1mwsc feature-branch[0m creates the worktree and launches Claude Code. Arguments after [1m--[0m are passed to the command, so [1mwsc feature -- 'Fix GH #322'[0m runs [1mclaude 'Fix GH #322'[0m, starting Claude with a prompt.[0m
+          
+          Template example: [1m-x code -- '{{ worktree_path }}'[0m opens VS Code at the worktree, [1m-x tmux -- new -s '{{ branch | sanitize }}'[0m starts a tmux session named after the branch.[0m
+
+      [1m[36m--clobber[0m
+          Remove stale paths at target
+
+      [1m[36m--no-cd[0m
+          Skip directory change after switching[0m
+          
+          Hooks still run normally, and an [1m--execute[0m program still starts in the worktree — only your shell stays put, so [1mwt switch feature --no-cd -x code -- .[0m opens the worktree in an editor and leaves your terminal where it was. Useful when hooks handle navigation (e.g., tmux workflows) or for CI/automation. Use --cd to override.[0m
+
+  [1m[36m-h[0m, [1m[36m--help[0m
+          Print help (see a summary with '-h')
+
+[1m[32mPicker Options:[0m
+      [1m[36m--branches[0m
+          Include branches without worktrees
+
+      [1m[36m--remotes[0m
+          Include remote branches
+
+      [1m[36m--prs[0m
+          Include open PRs/MRs
+
+[1m[32mAutomation:[0m
+      [1m[36m--no-hooks[0m
+          Skip hooks
+
+      [1m[36m--format[0m[36m [0m[36m<FORMAT>[0m
+          Output format[0m
+          
+          JSON prints one structured result to stdout once the switch, including any --execute command, completes. A worktree created before a later failure remains in place and is included in the result. Read stdout even when the exit status is nonzero. Errors, diagnostics, and --execute output go to stderr. Failure before a result exists and canceling the interactive picker produce no result. Background hooks run independently of the result. Designed for tool integration (e.g., Claude Code 
+          WorktreeCreate hooks).[0m
+          
+          [default: text]
+          [possible values: text, json]
+
+[1m[32mGlobal Options:[0m
+  [1m[36m-C[0m[36m [0m[36m<path>[0m
+          Working directory for this command
+
+      [1m[36m--config[0m[36m [0m[36m<path>[0m
+          User config file path
+
+      [1m[36m--config-set[0m[36m [0m[36m<toml>[0m
+          Override config with inline TOML, e.g. --config-set list.full=true (repeatable)
+
+  [1m[36m-v[0m, [1m[36m--verbose[0m[36m...[0m
+          Verbose output (-v: info logs + hook/alias template variables on stderr; -vv: also debug logs and raw subprocess output written to .git/wt/logs/). Set WORKTRUNK_VERBOSE=0|1|2 to apply the same level everywhere — including shell completion, which no flag can reach
+
+  [1m[36m-y[0m, [1m[36m--yes[0m
+          Skip approval prompts
+
+Worktrees are addressed by branch name; paths are computed from a configurable template. Unlike [2mgit switch[0m, this navigates between worktrees rather than changing branches in place.
+
+[1m[32mExamples[0m
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch feature-auth           # Switch to worktree[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m-[0m[2m                      # Previous worktree (like cd -)[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m new-feature   # Create new branch and worktree[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m hotfix [0m[2m[36m--base[0m[2m production[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch pr:123                 # Switch to PR #123's branch[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch https://github.com/owner/repo/pull/123   # ...or paste the PR's URL[0m
+
+[1m[32mCreating a branch[0m
+
+The [2m--create[0m flag creates a new branch from [2m--base[0m — the default branch unless specified. Without [2m--create[0m, the branch must already exist. Switching to a remote branch (e.g., [2mwt switch feature[0m when only [2morigin/feature[0m exists) creates a local tracking branch.
+
+A new branch tracks the remote branch it starts from only when the two share a name: [2m--create release --base origin/release[0m tracks [2morigin/release[0m, while [2m--create feature --base origin/release[0m gets no upstream. Publish such a branch with [2mgit push --set-upstream origin <branch>[0m, or set git's [2mpush.autoSetupRemote = true[0m once.
+
+[1m[32mCreating worktrees[0m
+
+If the branch already has a worktree, [2mwt switch[0m changes directories to it. Otherwise, it creates one:
+
+1. Runs pre-switch hooks, blocking until complete
+2. Creates worktree at configured path (or at [2m--path[0m)
+3. Switches to new directory
+4. Runs pre-start hooks, blocking until complete
+5. Spawns post-start and post-switch hooks in the background
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch feature                        # Existing branch → creates worktree[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m feature               # New branch and worktree[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m fix [0m[2m[36m--base[0m[2m release    # New branch from release[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m temp [0m[2m[36m--no-hooks[0m[2m       # Skip hooks[0m
+
+[32mCustom path [experimental][0m
+
+[2m--path[0m places one worktree outside the [2mworktree-path[0m template, keeping the branch name intact:
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m feature/JIRA-1234 [0m[2m[36m--path[0m[2m ../dark-mode[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch ../dark-mode                   # Switch by path...[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch feature/JIRA-1234              # ...or by branch[0m
+
+Other commands reach it by branch or path as usual. [2mwt list[0m marks it [2m⚐[0m, since it isn't at the path its branch implies, and [2mwt step relocate[0m offers to move it back to the template path.
+
+[1m[32mNaming a worktree[0m
+
+Worktrees are addressed by branch name, and every argument that takes one also accepts the path of the worktree itself — resolved after the branch, so a directory never shadows a branch sharing its name. A path names what a branch cannot: a detached worktree, or one of two checkouts of the same branch. Relative paths resolve against [2m-C[0m and a leading [2m~[0m against the home directory, so a path worktrunk printed can be pasted back.
+
+[1m[32mShortcuts[0m
+
+ Shortcut            Meaning            
+ ──────── ───────────────────────────── 
+ [2m^[0m        Default branch ([2mmain[0m/[2mmaster[0m)  
+ [2m@[0m        Current branch/worktree       
+ [2m-[0m        Previous worktree (like [2mcd -[0m) 
+ [2mpr:{N}[0m   GitHub PR #N's branch         
+ [2mmr:{N}[0m   GitLab MR !N's branch         
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m-[0m[2m                           # Back to previous[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch ^                           # Default branch worktree[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m fix [0m[2m[36m--base=@[0m[2m       # Branch from current HEAD[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--create[0m[2m fix [0m[2m[36m--base=pr:123[0m[2m  # Branch from PR #123's head[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch pr:123                      # PR #123's branch[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch mr:101                      # MR !101's branch[0m
+
+Shortcuts also apply to [2m--base[0m.
+
+[1m[32mInteractive picker[0m
+
+When called without arguments, [2mwt switch[0m opens an interactive picker to browse and select worktrees with live preview. The candidate set widens with [2m--branches[0m (local branches without worktrees), [2m--remotes[0m (remote branches), and [2m--prs[0m (open PRs/MRs — see below).
+
+The CI column shows each row's PR/MR CI and review status, the same as [2mwt list --full[0m.
+
+[1mKeybindings:[0m
+
+      Key                                       Action                                  
+ ───────────── ──────────────────────────────────────────────────────────────────────── 
+ [2m↑[0m/[2m↓[0m           Navigate worktree list                                                   
+ (type)        Filter worktrees                                                         
+ [2mEnter[0m         Switch to selected worktree                                              
+ [2mAlt-c[0m         Create new worktree named as entered text                                
+ [2mAlt-x[0m         Remove selected worktree/branch (never forces; not the current worktree) 
+ [2mAlt-y[0m         Copy selected branch name to the clipboard                               
+ [2mAlt-o[0m         Open the selected row's PR/MR URL in the browser                         
+ [2mAlt-r[0m         Refresh the list (pick up worktrees created elsewhere)                   
+ [2mEsc[0m           Cancel                                                                   
+ [2mAlt-1[0m–[2mAlt-8[0m   Jump to a preview tab                                                    
+ [2mTab[0m/[2mShift-Tab[0m Cycle available preview tabs forward/backward                            
+ [2mAlt-p[0m         Toggle preview panel                                                     
+ [2mCtrl-u[0m/[2mCtrl-d[0m Scroll preview up/down                                                   
+
+On macOS, [2mAlt[0m is the Option key; the terminal needs to send it as Meta (e.g. Terminal.app's Use Option as Meta key).
+
+The filter matches each row's branch, path, and — when it has a PR/MR — the PR/MR's number, title, and author. Typing [36m+[0m narrows to linked worktrees, and [2m@[0m to the current worktree.
+
+[1mPreview tabs:[0m
+
+1. [1mdiff[0m — One net diff from the comparison base through the current worktree: committed, staged, unstaged, and untracked changes
+2. [1mworking[0m — Staged, unstaged, and untracked changes against [2mHEAD[0m
+3. [1mcommitted[0m — Committed changes since the comparison base
+4. [1mlog[0m — Recent commits; commits already on the default branch have dimmed hashes
+5. [1mremote⇅[0m — Ahead/behind diff vs upstream tracking branch
+6. [1msummary[0m — LLM-generated branch summary; requires [2m[list] summary = true[0m and [2mcommit.generation[0m
+7. [1mpr[0m — The selected row's PR/MR, for any row whose branch has one
+8. [1mcomments[0m — The PR/MR's comment thread, fetched from the forge for any row whose branch has one
+
+The comparison base is the merge-base with the default branch, or with its upstream when the local default branch lags. The picker opens on [1mdiff[0m for local rows and [1mpr[0m for a PR/MR listed by [2m--prs[0m but not available locally. A tab with no content for the selected row has a dimmed label, and the active tab's label is underlined. [2mTab[0m and [2mShift-Tab[0m skip the dimmed tabs; [2mAlt-1[0m through [2mAlt-8[0m open any tab directly. After you choose a tab, that choice stays active while you navigate.
+
+[1mPager configuration:[0m The preview panel pipes diff output through git's pager. Override in user config:
+
+[107m [0m [2m# ~/.config/worktrunk/config.toml[0m
+[107m [0m [2m[36m[switch.picker][0m
+[107m [0m [2mpager = [0m[2m[32m"delta --paging=never --width=$COLUMNS"[0m
+
+[1mHiding the preview:[0m Set [2mpreview = false[0m under [2m[switch.picker][0m to open the picker with the preview hidden; [2mAlt-p[0m still shows it.
+
+[1m[32mPull requests and merge requests[0m
+
+The [2mpr:<number>[0m / [2mmr:<number>[0m shortcut and the PR/MR's web URL both resolve to its branch. For same-repo PRs/MRs, worktrunk switches to the branch directly. For fork PRs/MRs, it fetches the ref ([2mrefs/pull/N/head[0m or [2mrefs/merge-requests/N/head[0m) and configures [2mpushRemote[0m to the fork URL.
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch pr:101                                  # GitHub PR #101[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch https://github.com/owner/repo/pull/101  # ...the same PR, by URL[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch mr:101                                  # GitLab MR !101[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch https://gitlab.com/owner/repo/-/merge_requests/101  # ...the same MR, by URL[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m switch [0m[2m[36m--prs[0m[2m                                   # Browse open PRs/MRs in the picker[0m
+
+Both work anywhere a branch is accepted, including [2m--base[0m. The [2m--create[0m flag cannot be used with a PR/MR reference since the branch already exists.
+
+If the PR or MR is on a fork, the local branch uses its branch name directly, so [2mgit push[0m works normally. A pre-existing local branch with that name tracking something else requires renaming first.
+
+The [2m--prs[0m flag adds the repository's open PRs (GitHub) or MRs (GitLab) that aren't already in the interactive picker. Selecting one switches to it as [2mpr:<number>[0m / [2mmr:<number>[0m would.
+
+Requires [2mgh[0m (GitHub), [2mglab[0m (GitLab), or an equivalent CLI installed and authenticated; see forge platform for Gitea, Azure DevOps, and other supported platforms.
+
+[1m[32mWhen wt switch fails[0m
+
+- [1mBranch doesn't exist[0m — Use [2m--create[0m, or check [2mwt list --branches[0m
+- [1mPath occupied[0m — Another worktree is at the target path; switch to it or remove it
+- [1mStale directory[0m — Use [2m--clobber[0m to remove a non-worktree directory at the target path
+
+To change which branch a worktree is on, use [2mgit switch[0m inside that worktree.
+
+[1m[32mSee also[0m
+
+- [2mwt list[0m — View all worktrees
+- [2mwt remove[0m — Delete worktrees when done
+- [2mwt merge[0m — Integrate changes back to the default branch
+
+----- stderr -----

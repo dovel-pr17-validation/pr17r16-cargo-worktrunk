@@ -1,0 +1,8028 @@
+use crate::common::mock_commands::MockResponse;
+use crate::common::{
+    BareRepoTest, TestRepo, canonical_temp_home, repo, set_temp_home_env, set_xdg_config_path,
+    setup_home_snapshot_settings, setup_snapshot_settings, setup_snapshot_settings_with_home,
+    temp_home, wt_command,
+};
+use ansi_str::AnsiStr;
+use insta_cmd::assert_cmd_snapshot;
+use rstest::rstest;
+use std::fs;
+use tempfile::TempDir;
+
+#[rstest]
+fn test_config_show_with_project_config(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create fake global config at XDG path (used on all platforms with etcetera)
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        global_config_dir.join("approvals.toml"),
+        r#"[projects."test-project"]
+approved-commands = ["npm install"]
+"#,
+    )
+    .unwrap();
+
+    // Create project config
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        r#"pre-start = "npm install"
+
+[post-start]
+server = "npm run dev"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_no_project_config(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create fake global config (but no project config) at XDG path
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_rejects_invalid_approvals_file(repo: TestRepo) {
+    fs::write(repo.test_approvals_path(), "not valid TOML [[[").unwrap();
+
+    let output = repo.wt_command().args(["config", "show"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.ansi_strip();
+    assert!(stdout.contains("Approvals @"), "stdout:\n{stdout}");
+    assert!(stdout.contains("approvals.toml"), "stdout:\n{stdout}");
+}
+
+#[rstest]
+fn test_config_show_hides_fully_approved_commands(repo: TestRepo) {
+    repo.write_project_config("pre-start = \"npm install\"\n");
+    let project = repo.repo.project_identifier().unwrap();
+    let project = toml::Value::String(project.to_string()).to_string();
+    fs::write(
+        repo.test_approvals_path(),
+        format!("[projects.{project}]\napproved-commands = [\"npm install\"]\n"),
+    )
+    .unwrap();
+
+    let output = repo.wt_command().args(["config", "show"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.ansi_strip();
+    assert!(!stdout.contains("APPROVALS"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("awaiting approval"), "stdout:\n{stdout}");
+}
+
+// ==================== System Config Tests ====================
+
+#[rstest]
+fn test_config_show_with_system_config(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create system config in a temp directory
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        r#"[merge]
+squash = true
+verify = true
+
+[commit.generation]
+command = "company-llm-tool"
+"#,
+    )
+    .unwrap();
+
+    // Create user config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_system_config_values_used_as_defaults(repo: TestRepo) {
+    // System config with a distinctive worktree-path template
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        "worktree-path = \".worktrees/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    // No user config — system config should provide the worktree-path default
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.args(["switch", "--create", "test-feature"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "switch --create should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Worktree should be at the system config template path
+    let expected_path = repo.root_path().join(".worktrees").join("test-feature");
+    assert!(
+        expected_path.exists(),
+        "Worktree should be created at system config template path: {}",
+        expected_path.display()
+    );
+}
+
+#[rstest]
+fn test_user_config_overrides_system_config(repo: TestRepo) {
+    // System config with one template
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        "worktree-path = \".worktrees/system/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    // User config overrides with a different template
+    let user_config_dir = tempfile::tempdir().unwrap();
+    let user_config_path = user_config_dir.path().join("config.toml");
+    fs::write(
+        &user_config_path,
+        "worktree-path = \".worktrees/user/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.env("WORKTRUNK_CONFIG_PATH", &user_config_path);
+    cmd.args(["switch", "--create", "test-feature"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "switch --create should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Should use user config template, not system
+    let user_path = repo.root_path().join(".worktrees/user/test-feature");
+    let system_path = repo.root_path().join(".worktrees/system/test-feature");
+    assert!(
+        user_path.exists(),
+        "Worktree should be at user config template path: {}",
+        user_path.display()
+    );
+    assert!(
+        !system_path.exists(),
+        "Worktree should NOT be at system config template path"
+    );
+}
+
+/// System and user config hooks are deep-merged by the config crate at the TOML
+/// key level. Differently-named commands within the same hook type coexist —
+/// system hooks and user hooks both run. Same-named commands: user replaces system.
+#[rstest]
+fn test_system_and_user_hooks_deep_merged(repo: TestRepo) {
+    // System config defines a named pre-merge hook
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        r#"[pre-merge]
+company-lint = "company-lint-tool"
+"#,
+    )
+    .unwrap();
+
+    // User config defines a differently-named pre-merge hook
+    let user_config_dir = tempfile::tempdir().unwrap();
+    let user_config_path = user_config_dir.path().join("config.toml");
+    fs::write(
+        &user_config_path,
+        r#"[pre-merge]
+my-lint = "my-lint-tool"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.env("WORKTRUNK_CONFIG_PATH", &user_config_path);
+    cmd.args(["hook", "show", "pre-merge"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook show should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Both hooks should be present (deep merge preserves differently-named keys)
+    assert!(
+        stdout.contains("company-lint-tool"),
+        "System hook should be preserved with different name, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("my-lint-tool"),
+        "User hook should be present, got:\n{stdout}"
+    );
+}
+
+/// When user config defines a hook with the same name as system config,
+/// the user's command replaces the system's command for that name.
+#[rstest]
+fn test_user_hook_replaces_same_named_system_hook(repo: TestRepo) {
+    // System config defines a named hook
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        r#"[pre-merge]
+lint = "company-lint-tool"
+"#,
+    )
+    .unwrap();
+
+    // User config defines the same-named hook with different command
+    let user_config_dir = tempfile::tempdir().unwrap();
+    let user_config_path = user_config_dir.path().join("config.toml");
+    fs::write(
+        &user_config_path,
+        r#"[pre-merge]
+lint = "my-lint-tool"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.env("WORKTRUNK_CONFIG_PATH", &user_config_path);
+    cmd.args(["hook", "show", "pre-merge"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook show should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // User's command should replace system's for the same name
+    assert!(
+        stdout.contains("my-lint-tool"),
+        "User's hook command should be present, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("company-lint-tool"),
+        "System's hook command should be replaced by user's same-named hook, got:\n{stdout}"
+    );
+}
+
+/// When user config doesn't define a hook type, the system config's hook is preserved.
+#[rstest]
+fn test_system_config_hooks_preserved_when_user_doesnt_override(repo: TestRepo) {
+    // System config defines pre-merge and pre-commit hooks
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        r#"[pre-merge]
+company-lint = "company-lint-tool"
+
+[pre-commit]
+company-format = "company-format-tool"
+"#,
+    )
+    .unwrap();
+
+    // User config only defines pre-merge (should leave system's pre-commit intact)
+    let user_config_dir = tempfile::tempdir().unwrap();
+    let user_config_path = user_config_dir.path().join("config.toml");
+    fs::write(
+        &user_config_path,
+        r#"[pre-merge]
+my-lint = "my-lint-tool"
+"#,
+    )
+    .unwrap();
+
+    // Check pre-commit — should still have system's hook
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.env("WORKTRUNK_CONFIG_PATH", &user_config_path);
+    cmd.args(["hook", "show", "pre-commit"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook show should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("company-format-tool"),
+        "System's pre-commit hook should be preserved when user doesn't override it, got:\n{stdout}"
+    );
+}
+
+/// A current-worktree `.config/wt.toml` that uses the deprecated
+/// `pre-create`/`post-create` hook keys keeps working through `wt hook show`:
+/// `ProjectConfig::load` migrates the keys to canonical `pre-start`/`post-start`
+/// before deserializing, and the type-argument value parser accepts both the
+/// canonical name and the deprecated alias. The rename is paused at Phase 1
+/// (issue #2838), so the migration is silent — no deprecation warning.
+#[rstest]
+fn test_hook_show_accepts_deprecated_create_hooks(repo: TestRepo) {
+    // Single-token commands so the bash highlighter doesn't split them with
+    // ANSI codes (same shape as the deep-merge `hook show` tests above).
+    repo.write_project_config(
+        r#"[pre-create]
+deps = "pre-create-tool"
+
+[post-create]
+deps = "post-create-tool"
+"#,
+    );
+
+    // The `-start` arg passes the canonical type name; the `-create` arg
+    // exercises the value parser accepting the deprecated alias. Both resolve
+    // to the same hook because `ProjectConfig::load` migrates the `[*-create]`
+    // config keys to canonical `[*-start]` before deserializing.
+    let cases = [
+        ("pre-start", "pre-create-tool"),
+        ("pre-create", "pre-create-tool"),
+        ("post-start", "post-create-tool"),
+        ("post-create", "post-create-tool"),
+    ];
+    for (type_arg, expected) in cases {
+        let mut cmd = repo.wt_command();
+        cmd.args(["hook", "show", type_arg])
+            .current_dir(repo.root_path());
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "`wt hook show {type_arg}` should succeed, stderr: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(expected),
+            "`wt hook show {type_arg}` should list the migrated hook, got:\n{stdout}"
+        );
+        // Phase 1 migrates silently — no deprecation warning, no config-show hint.
+        assert!(
+            !stderr.to_lowercase().contains("deprecated") && !stderr.contains("config show"),
+            "`wt hook show {type_arg}` should migrate silently, stderr:\n{stderr}"
+        );
+    }
+}
+
+#[rstest]
+fn test_config_show_absent_system_config_is_a_user_config_hint(repo: TestRepo, temp_home: TempDir) {
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    cmd.env_remove("WORKTRUNK_SYSTEM_CONFIG_PATH");
+    cmd.arg("config").arg("show").current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("SYSTEM CONFIG")
+            && stdout.contains("Optional system config not found")
+            && stdout.contains("worktrunk/config.toml"),
+        "Expected a compact system config hint, got:\n{stdout}"
+    );
+}
+
+/// Test that `config show` displays empty system config with a hint
+#[rstest]
+fn test_config_show_empty_system_config(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create empty system config
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(&system_config_path, "").unwrap();
+
+    // Create user config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+#[case::system("system")]
+#[case::user("user")]
+#[case::project("project")]
+fn test_config_show_reports_unreadable_source_and_continues(repo: TestRepo, #[case] source: &str) {
+    let mut cmd = repo.wt_command();
+    let system_dir = if source == "system" {
+        let dir = tempfile::tempdir().unwrap();
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", dir.path());
+        Some(dir)
+    } else {
+        None
+    };
+
+    match source {
+        "user" => fs::write(repo.test_config_path(), [0xff]).unwrap(),
+        "project" => {
+            repo.write_project_config("");
+            fs::write(repo.root_path().join(".config/wt.toml"), [0xff]).unwrap();
+        }
+        "system" => {}
+        _ => unreachable!(),
+    }
+
+    let output = cmd.args(["config", "show"]).output().unwrap();
+    drop(system_dir);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.ansi_strip();
+    assert!(stdout.contains("Cannot read config"), "stdout:\n{stdout}");
+    assert!(stdout.contains("OTHER"), "report was truncated:\n{stdout}");
+}
+
+/// Commands that require user config retain its typed parser diagnosis through
+/// their operation context and fail cleanly in both debug and release builds.
+#[rstest]
+#[case::step_prune(&["step", "prune", "--dry-run"])]
+#[case::step_relocate(&["step", "relocate", "--dry-run"])]
+#[case::step_eval(&["step", "eval", "{{ branch }}"])]
+#[case::step_for_each(&["step", "for-each", "--", "true"])]
+#[case::config_show_full(&["config", "show", "--full"])]
+fn test_unparsable_user_config_errors_legibly(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[case] args: &[&str],
+) {
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "invalid = [toml\n").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(args).current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    // `config show --full` reaches its `UserConfig::load()` after the version
+    // check, so inject the version the way the other `--full` tests do rather
+    // than letting the case call GitHub. The other cases ignore it.
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // 101 is the debug_assert panic; 1 is the error this should be.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{args:?} should fail cleanly, not panic; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "{args:?} panicked; stderr:\n{stderr}"
+    );
+    // The header the renderer needs, and the parse detail it would otherwise
+    // have replaced with "Command failed".
+    assert!(
+        stderr.contains("User config @"),
+        "{args:?} should name what failed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unclosed array"),
+        "{args:?} should carry the parser's own diagnosis; stderr:\n{stderr}"
+    );
+}
+
+/// Test that `config show` displays invalid system config with error details
+#[rstest]
+fn test_config_show_invalid_system_config(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create system config with invalid TOML
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(&system_config_path, "invalid = [toml\n").unwrap();
+
+    // Create user config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Test that system config with unknown keys triggers a warning during config loading
+#[rstest]
+fn test_system_config_unknown_keys_warning_during_load(repo: TestRepo) {
+    // Create system config with an unknown key
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        "[totally-unknown-section]\nkey = \"value\"",
+    )
+    .unwrap();
+
+    // Run `wt list` which triggers config loading and unknown key warnings
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.arg("list").current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has unknown field"),
+        "Expected unknown field warning from system config load, got: {stderr}"
+    );
+}
+
+/// System config is routed through the same deprecation gate as user config:
+/// a non-fatal deprecation surfaces a warning, and a deprecated hook key is
+/// migrated to its canonical name and stays active.
+#[rstest]
+fn test_system_config_deprecations_pass_through_gate(repo: TestRepo) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        r#"post-create = "npm install"
+
+[select]
+pager = "delta --paging=never"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path)
+        .env("NO_COLOR", "1");
+    cmd.args(["hook", "show", "post-start"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("System config") && stderr.contains("[select]"),
+        "non-fatal deprecation in system config should warn, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("npm install"),
+        "deprecated post-create key should migrate to post-start and stay active, got: {stdout}"
+    );
+}
+
+#[rstest]
+fn test_config_show_outside_git_repo(mut repo: TestRepo, temp_home: TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create fake global config at XDG path
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_mock_commands(&mut cmd);
+        cmd.arg("config").arg("show").current_dir(temp_dir.path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// `--full` outside a repository still renders every section: the
+/// diagnostics skip the repo-specific CI check instead of failing the report.
+#[rstest]
+fn test_config_show_full_outside_git_repo(mut repo: TestRepo, temp_home: TempDir) {
+    let temp_dir = worktrunk::testing::test_tempdir();
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let mut cmd = wt_command();
+    repo.configure_mock_commands(&mut cmd);
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.args(["config", "show", "--full"])
+        .current_dir(temp_dir.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .ansi_strip()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "config show --full outside a repo failed: {stderr}"
+    );
+    assert!(stdout.contains("USER CONFIG"), "stdout: {stdout}");
+    assert!(stdout.contains("DIAGNOSTICS"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("CI status requires"),
+        "outside a repo the CI check should fall back to its hint, stdout: {stdout}"
+    );
+}
+
+#[rstest]
+fn test_config_show_zsh_compinit_warning(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Use a custom zsh config directory so the advisory must name the same
+    // file as the integration detector.
+    let zdotdir = canonical_temp_home(&temp_home).join("zsh-config");
+    fs::create_dir_all(&zdotdir).unwrap();
+    fs::write(
+        zdotdir.join(".zshrc"),
+        r#"# wt integration but no compinit!
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let mut settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.add_redaction(".env.ZDOTDIR", "[TEST_ZDOTDIR]");
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        // Force compinit warning for deterministic tests across environments
+        cmd.env("WORKTRUNK_TEST_COMPINIT_MISSING", "1");
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("ZDOTDIR", &zdotdir);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Cover the per-shell "Skipped" row in `wt config show`. After #2574,
+/// `scan_shell_configs` only adds a shell to `skipped` when its binary is on
+/// PATH AND no rc file/dir exists — without an installed binary the entry
+/// never reaches `render_shell_status`. Here bash is flagged installed (test
+/// override) with no `.bashrc`, so the Skipped row renders and the styling
+/// (`<bold>{shell}</>: <dim>Skipped; {path} not found</>`) is verified.
+#[rstest]
+fn test_config_show_skipped_with_installed_binary(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_BASH_INSTALLED", "1");
+        cmd.env("SHELL", "/bin/zsh");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_partial_shell_config_shows_hint(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create .bashrc WITHOUT wt integration
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"# Some bash config
+export PATH="$HOME/bin:$PATH"
+"#,
+    )
+    .unwrap();
+
+    // Create .zshrc WITH wt integration
+    fs::write(
+        temp_home.path().join(".zshrc"),
+        r#"# wt integration
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1"); // Bypass zsh subprocess check
+        // Set SHELL=zsh so the "verify wrapper loaded" hint appears under zsh
+        // (configured + matches current shell) but is suppressed under bash.
+        cmd.env("SHELL", "/bin/zsh");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Test that config show displays fish shell with completions configured
+#[rstest]
+fn test_config_show_fish_with_completions(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create fish functions directory with wt.fish (shell extension configured)
+    let functions = temp_home.path().join(".config/fish/functions");
+    fs::create_dir_all(&functions).unwrap();
+    let fish_config = functions.join("wt.fish");
+    // Write the exact wrapper content that install would create
+    let init =
+        worktrunk::shell::ShellInit::with_prefix(worktrunk::shell::Shell::Fish, "wt".to_string());
+    let wrapper_content = init.generate_fish_wrapper().unwrap();
+    fs::write(&fish_config, format!("{}\n", wrapper_content)).unwrap();
+
+    // Create fish completions file (completions configured)
+    let completions = temp_home.path().join(".config/fish/completions");
+    fs::create_dir_all(&completions).unwrap();
+    fs::write(completions.join("wt.fish"), "# fish completions\n").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Test that config show displays fish shell without completions configured
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_config_show_fish_without_completions(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] completion_directory: bool,
+) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create fish functions directory with wt.fish (shell extension configured)
+    let functions = temp_home.path().join(".config/fish/functions");
+    fs::create_dir_all(&functions).unwrap();
+    let fish_config = functions.join("wt.fish");
+    // Write the exact wrapper content that install would create
+    let init =
+        worktrunk::shell::ShellInit::with_prefix(worktrunk::shell::Shell::Fish, "wt".to_string());
+    let wrapper_content = init.generate_fish_wrapper().unwrap();
+    fs::write(&fish_config, format!("{}\n", wrapper_content)).unwrap();
+
+    // A missing completion file and a directory at its path must both leave
+    // the installed wrapper visible, with completions not configured.
+    if completion_directory {
+        fs::create_dir_all(temp_home.path().join(".config/fish/completions/wt.fish")).unwrap();
+    }
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!("config_show_fish_without_completions", cmd);
+    });
+}
+
+/// Test that config show displays "Outdated" when fish wrapper exists but has different code.
+///
+/// The wrapper file contains `function wt` which matches the command name at a word boundary,
+/// but `is_shell_integration_line()` won't match it (it looks for eval/source patterns).
+/// This should NOT trigger a "Found wt ... but not detected as integration" warning because
+/// the wrapper file IS the integration — `scan_shell_configs` already identified it (as
+/// outdated). Only the "Outdated shell extension" warning should appear.
+#[rstest]
+fn test_config_show_fish_outdated_wrapper(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create fish functions directory with an outdated wt.fish (different functional code)
+    let functions = temp_home.path().join(".config/fish/functions");
+    fs::create_dir_all(&functions).unwrap();
+    fs::write(
+        functions.join("wt.fish"),
+        "# worktrunk shell integration for fish\nfunction wt\n    command wt-old $argv\nend\n",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Test that config show displays "Outdated" when nushell wrapper exists but has different code.
+///
+/// Same false-positive suppression as the fish variant: the wrapper file contains `def --wrapped wt`
+/// which matches the command name, but `scan_shell_configs` already recognized the file as
+/// integration (outdated). Only the "Outdated" warning should appear, not the generic
+/// "not detected as integration" warning.
+#[rstest]
+fn test_config_show_nushell_outdated_wrapper(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create the nushell vendor-autoload directory with an outdated wt.nu.
+    // Pin the dir via the test override so the path is deterministic across
+    // platforms (and independent of whether `nu` is installed).
+    let autoload = canonical_temp_home(&temp_home).join(".local/share/nushell/vendor/autoload");
+    fs::create_dir_all(&autoload).unwrap();
+    fs::write(
+        autoload.join("wt.nu"),
+        "# worktrunk shell integration for nushell\ndef --wrapped wt [...args] {\n    command wt-old ...$args\n}\n",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_NU_VENDOR_AUTOLOAD_DIR", &autoload);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Cover the `.exe` alias hint inside `render_already_configured`. The hint
+/// fires when at least one matched integration line in the rc file uses
+/// `wt.exe` — common on Git Bash where the binary is `wt.exe` but POSIX
+/// aliases must still target `wt`. We pair the canonical line (so the row
+/// hits `AlreadyExists`) with an extra `wt.exe` line in the same file so
+/// `detection.matched_lines` carries the `.exe` content.
+#[rstest]
+fn test_config_show_bash_matched_exe_emits_alias_hint(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"# Canonical line so the row reports AlreadyExists.
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init bash)"; fi
+# Stale wt.exe form left over from a Windows install — scan_for_detection_details
+# still recognizes it as a matched integration line.
+eval "$(wt.exe config shell init bash)"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+        cmd.env("WORKTRUNK_TEST_BASH_INSTALLED", "1");
+        // SHELL=bash so current_shell() == Bash and the verify-wrapper hint
+        // appears under bash (not duplicated for other shells).
+        cmd.env("SHELL", "/bin/bash");
+
+        // Pre-snapshot guard: confirm the unredacted output really did emit
+        // the alias hint. The shared `wt\.exe` → `wt` redaction collapses
+        // both `<underline>wt</>` and `<underline>wt.exe</>` to the same
+        // visual `wt` in the snapshot, which would otherwise hide whether
+        // the .exe branch ran at all.
+        let raw = String::from_utf8_lossy(&cmd.output().unwrap().stdout).to_string();
+        assert!(
+            raw.contains("Creates shell function") && raw.contains("not ") && raw.contains(".exe"),
+            "Expected the .exe alias hint in unredacted output, got:\n{raw}"
+        );
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_zsh_compinit_correct_order(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create .zshrc with compinit enabled - completions will work
+    fs::write(
+        temp_home.path().join(".zshrc"),
+        r#"# compinit enabled
+autoload -Uz compinit && compinit
+
+# wt integration
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1"); // Bypass zsh subprocess check (unreliable on CI)
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Smoke-test the actual zsh probe path (no WORKTRUNK_TEST_COMPINIT_* overrides).
+///
+/// This is behind shell-integration-tests because it requires `zsh` to be installed.
+#[rstest]
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+fn test_config_show_zsh_compinit_real_probe_warns_when_missing(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create .zshrc with the canonical integration line (exact match required for config show),
+    // plus an explicit removal of compdef so the probe is deterministic.
+    fs::write(
+        temp_home.path().join(".zshrc"),
+        r#"unset -f compdef 2>/dev/null
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        // Keep PATH minimal so the probe zsh doesn't find a globally-installed `wt`.
+        let path = crate::common::setup_minimal_path_with_git(&temp_home.path().join("bin"));
+        cmd.env("PATH", path);
+        cmd.env(
+            "ZDOTDIR",
+            crate::common::canonicalize(temp_home.path())
+                .unwrap_or_else(|_| temp_home.path().to_path_buf()),
+        );
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Completions won't work; add to"),
+            "Expected compinit warning, got:\n{stdout}"
+        );
+    });
+}
+
+/// Smoke-test the actual zsh probe path when compdef exists.
+///
+/// This is behind shell-integration-tests because it requires `zsh` to be installed.
+#[rstest]
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+fn test_config_show_zsh_compinit_no_warning_when_present(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Define compdef directly to avoid relying on compinit behavior (which can warn
+    // about insecure directories in CI). The probe checks for compdef presence.
+    fs::write(
+        temp_home.path().join(".zshrc"),
+        r#"compdef() { :; }
+if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        // Keep PATH minimal so the probe zsh doesn't find a globally-installed `wt`.
+        let path = crate::common::setup_minimal_path_with_git(&temp_home.path().join("bin"));
+        cmd.env("PATH", path);
+        cmd.env(
+            "ZDOTDIR",
+            crate::common::canonicalize(temp_home.path())
+                .unwrap_or_else(|_| temp_home.path().to_path_buf()),
+        );
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("Completions won't work; add to"),
+            "Expected no compinit warning, got:\n{stdout}"
+        );
+    });
+}
+
+#[rstest]
+fn test_config_show_warns_unknown_project_keys(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    // Create project config with typo: post-merge-command instead of post-merge
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[post-merge-command]\ndeploy = \"task deploy\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_warns_unknown_user_keys(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config with typo: commit-gen instead of commit-generation
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n\n[commit-gen]\ncommand = \"llm\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Tests that loading a config with a truly unknown key (not valid in either config type)
+/// emits a warning during config loading (not just config show).
+#[rstest]
+fn test_unknown_project_key_warning_during_load(repo: TestRepo, temp_home: TempDir) {
+    // Create project config with truly unknown key (not valid in either config type)
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[invalid-section-name]\nkey = \"value\"",
+    )
+    .unwrap();
+
+    // Run `wt list` which loads project config via ProjectConfig::load()
+    // This triggers warn_unknown_fields (different from warn_unknown_keys used by config show)
+    let mut cmd = repo.wt_command();
+    cmd.arg("list").current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has unknown field"),
+        "Expected unknown field warning during config load, got: {stderr}"
+    );
+}
+
+/// The load-time unknown-field warning fires from a linked worktree too.
+///
+/// `[merge]` in project config is ignored at runtime, and the warning is the
+/// only thing that says so. Suppressing it outside the primary worktree hid it
+/// from exactly the commands the keys govern — `wt merge` runs from the
+/// feature worktree — so a repo's merge policy diverged silently between a
+/// machine carrying the `[projects."<id>"]` entry and a fresh checkout (#4144).
+#[rstest]
+fn test_misplaced_project_key_warns_from_linked_worktree(mut repo: TestRepo, temp_home: TempDir) {
+    let feature_wt = repo.add_worktree("feature");
+
+    // `[merge]` is user-config-only, so project config ignores it entirely.
+    let config_dir = feature_wt.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[merge]\nsquash = false\nff = false\n",
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.arg("list").current_dir(&feature_wt);
+    set_temp_home_env(&mut cmd, temp_home.path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("belongs in user config"),
+        "Expected misplaced-key warning from a linked worktree, got: {stderr}"
+    );
+}
+
+/// Tests that when a user-config-only key (commit-generation) appears in project config,
+/// the warning suggests moving it to user config.
+#[rstest]
+fn test_config_show_suggests_user_config_for_commit_generation(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create empty global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    // Create project config with commit-generation (which belongs in user config)
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[commit-generation]\ncommand = \"claude\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Tests that when a project-config-only key (ci) appears in user config,
+/// the warning suggests moving it to project config.
+#[rstest]
+fn test_config_show_suggests_project_config_for_ci(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config with ci section (which belongs in project config)
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n\n[ci]\nplatform = \"github\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_invalid_user_toml(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config with invalid TOML syntax
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "this is not valid toml {{{",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_unknown_list_column(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "[list]\njson-schema = 2\ncolumns = [\"branch\", \"nosuchcolumn\"]\n",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_invalid_project_toml(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create valid global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    // Create project config with invalid TOML syntax
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("wt.toml"), "invalid = [unclosed bracket").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_full_not_configured(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create isolated config directory
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        // Inject current version for deterministic version check output
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// A successful connectivity probe is existing state, and includes the actual
+/// response from the configured command in the diagnostic report.
+#[rstest]
+fn test_config_show_full_working_commit_generation(repo: TestRepo) {
+    repo.write_test_config(
+        "[commit.generation]\ncommand = \"cat >/dev/null && echo diagnostic-probe\"\n",
+    );
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .args(["config", "show", "--full"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.ansi_strip();
+    let lines: Vec<_> = stdout.lines().collect();
+    let index = lines
+        .iter()
+        .position(|line| line.contains("Commit generation working"))
+        .unwrap();
+    insta::assert_snapshot!(lines[index..index + 2].join("\n"), @"
+    ○ Commit generation working (cat >/dev/null && echo diagnostic-probe)
+      diagnostic-probe
+    ");
+}
+
+#[rstest]
+fn test_config_show_full_command_not_found(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create isolated config directory
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[commit.generation]
+command = "nonexistent-llm-command-12345 -m test-model"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        // Inject current version for deterministic version check output
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_full_update_available(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create isolated config directory
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        // Inject a higher version to trigger update-available message
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", "99.0.0");
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_full_version_check_unavailable(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        // Simulate a fetch failure
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", "error");
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// `wt config show --full` against a Gitea remote reports the `tea` CLI row.
+#[rstest]
+fn test_config_show_full_gitea_remote(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    // The Gitea diagnostics row only depends on `tea`'s state; mock it as
+    // installed (no login configured in the temp home).
+    repo.setup_mock_tea_installed();
+
+    // The fixture already has an `origin`; point it at a Gitea host.
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitea.example.com/example/repo.git",
+    ]);
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// tea owns login discovery; Worktrunk reads only its structured, local-only
+/// command output. The mock replaces the external tea CLI, not our process
+/// wiring or diagnostics logic.
+#[rstest]
+#[case::login(r#"[{"name":"local","url":"https://gitea.example.com","ssh_host":"","user":"alice","default":"true"}]"#, 0, true)]
+#[case::other_host(r#"[{"name":"local","url":"https://forge.example.test","ssh_host":"","user":"alice","default":"true"}]"#, 0, false)]
+#[case::empty("[]", 0, false)]
+#[case::invalid_json("not JSON", 0, false)]
+#[case::invalid_shape(r#"[{"name":"missing-url"}]"#, 0, false)]
+#[case::failed("[]", 1, false)]
+fn test_config_show_full_tea_login_discovery(
+    mut repo: TestRepo,
+    #[case] logins: &str,
+    #[case] exit_code: i32,
+    #[case] authenticated: bool,
+) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    MockConfig::new("tea")
+        .version("tea version development (mock)")
+        .command(
+            "logins list --output",
+            MockResponse::output(logins).with_exit_code(exit_code),
+        )
+        .command("_default", MockResponse::exit(1))
+        .write(repo.mock_bin_path().unwrap());
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitea.example.com/example/repo.git",
+    ]);
+    let call_log = tempfile::tempdir().unwrap();
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--full"])
+        .env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let plain = stdout.ansi_strip();
+    let status = if authenticated {
+        "tea installed & authenticated"
+    } else {
+        "tea installed but not authenticated"
+    };
+    assert!(plain.contains(status), "{plain}");
+    let calls = fs::read_to_string(call_log.path().join("tea.calls")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["--version", "logins list --output json"]
+    );
+}
+
+/// Each forge's diagnostics use the shared probe while rendering only the
+/// CLI selected by the repository's remote.
+#[rstest]
+#[case::github("github.com", "gh", "glab")]
+#[case::gitlab("gitlab.com", "glab", "gh")]
+fn test_config_show_full_forge_diagnostics(
+    mut repo: TestRepo,
+    #[case] host: &str,
+    #[case] selected_cli: &str,
+    #[case] other_cli: &str,
+) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    let mock_bin = repo.mock_bin_path().unwrap();
+    MockConfig::new("tea")
+        .version("tea version development (mock)")
+        .command("logins list --output", MockResponse::output("[]"))
+        .command("_default", MockResponse::exit(1))
+        .write(mock_bin);
+    MockConfig::new("az")
+        .command("_default", MockResponse::exit(1))
+        .write(mock_bin);
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        &format!("https://{host}/example/repo.git"),
+    ]);
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--full"])
+        .env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let plain = stdout.ansi_strip();
+    assert!(
+        plain.contains(&format!("{selected_cli} installed but not authenticated")),
+        "{plain}"
+    );
+    assert!(
+        !plain.contains(&format!("{other_cli} installed")),
+        "{plain}"
+    );
+}
+
+/// Diagnostics stop after a tea login probe is natively interrupted, before
+/// starting the next tool's probe.
+#[cfg(unix)]
+#[rstest]
+fn test_config_show_full_tea_login_native_interruption(mut repo: TestRepo) {
+    use crate::common::mock_commands::MockConfig;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    let mock_bin = repo.mock_bin_path().unwrap();
+    let tea = mock_bin.join("tea");
+    fs::write(
+        &tea,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then exit 0; fi
+kill -INT $$
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&tea, fs::Permissions::from_mode(0o755)).unwrap();
+    MockConfig::new("az")
+        .command("_default", MockResponse::exit(1))
+        .write(mock_bin);
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitea.example.com/example/repo.git",
+    ]);
+    let call_log = tempfile::tempdir().unwrap();
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--full"])
+        .env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(2), "{output:?}");
+    assert!(!call_log.path().join("az.calls").exists());
+}
+
+/// `wt config show --full` against an Azure DevOps remote reports the `az` CLI
+/// row plus the `azure-devops` extension, which the whole `az repos` command
+/// group ships in: without it CI status stays blank however well `az` is
+/// authenticated, and only the user can install it.
+#[rstest]
+#[case::missing("[]", "config_show_full_azure_extension_missing")]
+#[case::installed(
+    r#"[{"name": "azure-devops", "version": "1.0.0"}]"#,
+    "config_show_full_azure_extension_installed"
+)]
+fn test_config_show_full_azure_remote(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] extensions_json: &str,
+    #[case] snapshot_name: &str,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_az_with_extensions(extensions_json);
+
+    // The fixture already has an `origin`; point it at an Azure DevOps host.
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://dev.azure.com/myorg/myproject/_git/test-repo",
+    ]);
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.arg("config")
+            .arg("show")
+            .arg("--full")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(snapshot_name, cmd);
+    });
+}
+
+/// Azure CLI's WinGet install puts `az.cmd` on PATH beside an extensionless
+/// bash script, with no `az.exe`. A bare `az` spawn has to reach the batch
+/// launcher, or `wt` reports an installed CLI as missing (#4401).
+#[cfg(windows)]
+#[rstest]
+fn test_config_show_finds_batch_launcher_az(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    let mock_bin = repo.mock_bin_path().unwrap().to_path_buf();
+    fs::write(
+        mock_bin.join("az_extensions.json"),
+        r#"[{"name": "azure-devops", "version": "1.0.0"}]"#,
+    )
+    .unwrap();
+    // The mock answers under another name, so the only `az` on the mock
+    // directory is the launcher pair WinGet installs.
+    MockConfig::new("azmock")
+        .version("azure-cli 2.60.0 (mock)")
+        .command("account show", MockResponse::exit(0))
+        .command("extension list", MockResponse::file("az_extensions.json"))
+        .command("_default", MockResponse::exit(1))
+        .write(&mock_bin);
+    let _ = fs::remove_file(mock_bin.join("az.exe"));
+    fs::write(mock_bin.join("az.cmd"), "@\"%~dp0azmock.exe\" %*\r\n").unwrap();
+    fs::write(
+        mock_bin.join("az"),
+        "#!/usr/bin/env bash\nexec \"$(dirname \"$0\")/azmock.exe\" \"$@\"\n",
+    )
+    .unwrap();
+
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://dev.azure.com/myorg/myproject/_git/test-repo",
+    ]);
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.args(["config", "show", "--full"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = text.ansi_strip();
+    assert!(
+        text.contains("az installed & authenticated"),
+        "az.cmd was not found:\n{text}"
+    );
+}
+
+#[rstest]
+fn test_config_show_github_remote(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // The fixture already has an `origin`; point it at a GitHub host.
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/example/repo.git",
+    ]);
+
+    // Create fake global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_gitlab_remote(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // The fixture already has an `origin`; point it at a GitLab host.
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitlab.com/example/repo.git",
+    ]);
+
+    // Create fake global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_empty_project_config(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create fake global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    // Create empty project config file
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("wt.toml"), "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+///
+/// Should show a hint about creating the config and display the default configuration.
+#[rstest]
+fn test_config_show_no_user_config(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Don't create any user config file - temp_home is empty
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+///
+/// When a shell config contains `wt` at a word boundary but it's NOT detected as
+/// shell integration, show a warning with file:line format to help debug detection.
+#[rstest]
+fn test_config_show_unmatched_candidate_warning(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create .bashrc with a line containing `wt` but NOT a valid integration pattern
+    // This should trigger the "unmatched candidate" warning
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"# Some bash config
+export PATH="$HOME/bin:$PATH"
+alias wt="git worktree"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Cover the unmatched-candidate `.exe` hint in `render_shell_status`. When
+/// the detector finds a `wt`-mentioning line that doesn't look like a valid
+/// integration AND any of the unmatched candidates contains `.exe`, an
+/// extra hint explains the function-name vs alias-name distinction.
+#[rstest]
+fn test_config_show_unmatched_candidate_exe_emits_extra_hint(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // `.bashrc` line containing `wt` at a word boundary but not in a
+    // shell-integration shape — the detector flags it as an unmatched
+    // candidate, and the `.exe` token triggers the extra alias hint.
+    // Use `export` rather than `alias` so the line doesn't get classified
+    // as a bypass alias (which would emit a separate warning instead).
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"# Custom shim path pointing at a Windows binary
+export WT_BIN="/c/Program Files/wt.exe"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+
+        // Pre-snapshot guard: the shared `wt\.exe` → `wt` redaction would
+        // otherwise hide whether the unmatched-candidate `.exe` branch ran.
+        let raw = String::from_utf8_lossy(&cmd.output().unwrap().stdout).to_string();
+        assert!(
+            raw.contains("creates shell function") && raw.contains(".exe"),
+            "Expected the .exe alias hint in unredacted output, got:\n{raw}"
+        );
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Verify that the unmatched candidate warning fires for a bash alias while being suppressed
+/// for a Fish wrapper file in the same `config show` run. This ensures wrapper-file suppression
+/// is path-specific and doesn't accidentally silence all unmatched candidate warnings.
+#[rstest]
+fn test_config_show_unmatched_candidate_not_suppressed_by_wrapper(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Fish wrapper (outdated) — should NOT trigger "not detected" warning
+    let functions = temp_home.path().join(".config/fish/functions");
+    fs::create_dir_all(&functions).unwrap();
+    fs::write(
+        functions.join("wt.fish"),
+        "# worktrunk shell integration for fish\nfunction wt\n    command wt-old $argv\nend\n",
+    )
+    .unwrap();
+
+    // Bash alias — SHOULD trigger "not detected" warning
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"# Some bash config
+alias wt="git worktree"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// When a config uses deprecated variables (repo_root, worktree, main_worktree),
+/// the CLI should warn and `wt config update` should apply the variable
+/// renames in place.
+#[rstest]
+fn test_deprecated_template_variables_show_warning(repo: TestRepo, temp_home: TempDir) {
+    // Write config with deprecated variables to the test config path
+    // (WORKTRUNK_CONFIG_PATH overrides XDG paths in tests)
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        // Use all deprecated variables: repo_root, worktree, main_worktree
+        // Note: hooks are at top-level in user config, not in a [hooks] section
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+pre-start = "ln -sf {{ repo_root }}/node_modules {{ worktree }}/node_modules"
+"#,
+    )
+    .unwrap();
+
+    // Use `wt list` which loads config through UserConfig::load() and triggers deprecation check
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // `wt list` emits warnings but never writes a .new file — that's
+    // `wt config update`'s job. Drive an update explicitly and verify the
+    // in-place migration applies all three variable renames.
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    assert!(cmd.output().unwrap().status.success());
+
+    let migrated = fs::read_to_string(config_path).unwrap();
+    assert!(migrated.contains("{{ repo }}"));
+    assert!(migrated.contains("{{ repo_path }}"));
+    assert!(migrated.contains("{{ worktree_path }}"));
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "config update must not leave a .new file"
+    );
+}
+
+/// With -v flag, template expansion logs appear alongside the deprecation
+/// warnings
+#[rstest]
+fn test_deprecated_template_variables_verbose_shows_content(repo: TestRepo, temp_home: TempDir) {
+    // Write config with deprecated variables
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+pre-start = "ln -sf {{ repo_root }}/node_modules {{ worktree }}/node_modules"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["-v", "list"]).current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Loading deprecated project config warns but leaves the config untouched.
+/// Materializing migrations is `wt config update`'s job.
+#[rstest]
+fn test_wt_list_never_writes_migration_file(repo: TestRepo, temp_home: TempDir) {
+    let project_config_path = repo.root_path().join(".config").join("wt.toml");
+    let original = r#"pre-start = "echo {{ main_worktree }}"
+"#;
+    repo.write_project_config(original);
+
+    let mut cmd = repo.wt_command();
+    cmd.arg("list").current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "wt list should succeed: {stderr}");
+    assert!(
+        stderr.contains("Project config")
+            && stderr.contains("main_worktree")
+            && stderr.contains("is deprecated"),
+        "Expected the project-config template deprecation warning, got: {stderr}"
+    );
+    assert!(
+        !project_config_path.with_extension("toml.new").exists(),
+        "wt list must not write a .new migration file"
+    );
+    assert_eq!(
+        fs::read_to_string(&project_config_path).unwrap(),
+        original,
+        "wt list must not modify the config"
+    );
+}
+
+/// A linked worktree loads its own project hooks, but suppresses project-config
+/// deprecation warnings because the migration is only actionable from the main
+/// worktree.
+#[rstest]
+fn test_deprecated_project_config_silent_in_linked_worktree(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    let linked_path = repo.add_worktree("feature");
+    let config_path = linked_path.join(".config").join("wt.toml");
+    let original = r#"pre-start = "echo linked-project-hook {{ main_worktree }}"
+"#;
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, original).unwrap();
+
+    // `hook show` loads and renders project config without globally
+    // suppressing warnings; only ProjectConfig's linked-worktree gate makes
+    // the deprecation silent.
+    let mut cmd = repo.wt_command();
+    cmd.args(["hook", "show", "pre-start", "--format=json"])
+        .current_dir(&linked_path)
+        .env("NO_COLOR", "1");
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt hook show from linked worktree should succeed: {stderr}"
+    );
+
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("hook show should emit valid JSON");
+    let project_hook = hooks
+        .as_array()
+        .expect("hook show should emit an array")
+        .iter()
+        .find(|hook| hook["source"] == "project" && hook["type"] == "pre-start")
+        .expect("linked-worktree project hook should be listed");
+    // The linked-worktree gate silences the warning, not the migration: the
+    // retired name is rewritten before serde parses, here as everywhere, since
+    // nothing would resolve it at render time.
+    assert_eq!(
+        project_hook["template"],
+        "echo linked-project-hook {{ repo }}"
+    );
+    assert!(
+        !(stderr.contains("Project config")
+            && stderr.contains("main_worktree")
+            && stderr.contains("deprecated")),
+        "Project-config deprecation warning should be silent in a linked worktree, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        original,
+        "loading linked-worktree project config must not modify it"
+    );
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "loading linked-worktree project config must not write a .new migration file"
+    );
+}
+
+/// `wt list` emits a user-config deprecation warning but never writes a
+/// `.new` file. Materializing migrations is `wt config update`'s job; passive
+/// commands stay side-effect-free on disk.
+#[rstest]
+fn test_user_config_deprecation_warns_without_writing(repo: TestRepo, temp_home: TempDir) {
+    repo.write_test_config(
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#,
+    );
+    let user_config_path = repo.test_config_path().to_path_buf();
+    let original = fs::read_to_string(&user_config_path).unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.arg("list").current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", &user_config_path);
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "wt list should succeed: {stderr}");
+    assert!(
+        stderr.contains("User config:") && stderr.contains("is deprecated"),
+        "Should emit user-config deprecation warning, got: {stderr}"
+    );
+    assert!(
+        !user_config_path.with_extension("toml.new").exists(),
+        "wt list must not write a .new migration file"
+    );
+    assert_eq!(
+        fs::read_to_string(&user_config_path).unwrap(),
+        original,
+        "wt list must not modify user config"
+    );
+}
+
+#[rstest]
+fn test_config_show_shell_integration_active(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic BINARIES output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    // Create a temp file for the directive file
+    let directive_file = temp_home.path().join("directive");
+    fs::write(&directive_file, "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        // Set the cd directive file to simulate shell integration being active.
+        cmd.env("WORKTRUNK_DIRECTIVE_CD_FILE", &directive_file);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// When shell integration is active at runtime (`WORKTRUNK_DIRECTIVE_CD_FILE` set) but
+/// the init line is NOT in the scanned config file (e.g., sourced from another file),
+/// config show should report "Configured ... (not found in ...)" instead of
+/// "Not configured".
+/// Regression test for https://github.com/max-sixty/worktrunk/issues/1306
+#[rstest]
+fn test_config_show_shell_active_but_not_in_config_file(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    // Create ~/.zshrc WITHOUT the init line (simulates it being in a sourced file)
+    fs::write(temp_home.path().join(".zshrc"), "# my zsh config\n").unwrap();
+
+    let directive_file = temp_home.path().join("directive");
+    fs::write(&directive_file, "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_DIRECTIVE_CD_FILE", &directive_file);
+        // Set SHELL to zsh so current_shell() returns Some(Zsh)
+        cmd.env("SHELL", "/bin/zsh");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_plugin_installed(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock claude CLI listing the worktrunk plugin
+    repo.setup_mock_claude_with_plugin_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_claude_available_plugin_not_installed(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock claude as available (but plugin not installed)
+    repo.setup_mock_claude_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_statusline_configured(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock claude CLI listing the plugin, AND the statusline
+    repo.setup_mock_claude_with_plugin_installed();
+    TestRepo::setup_statusline_configured(temp_home.path());
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_codex_available(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock codex as available
+    repo.setup_mock_codex_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_opencode_available_plugin_not_installed(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock opencode as available (but plugin not installed)
+    repo.setup_mock_opencode_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_opencode_plugin_installed(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock opencode CLI and plugin as installed
+    repo.setup_mock_opencode_installed();
+    TestRepo::setup_opencode_plugin_installed(temp_home.path());
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_opencode_plugin_outdated(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock opencode CLI as installed
+    repo.setup_mock_opencode_installed();
+
+    // Write an outdated plugin file (different content from embedded source)
+    let plugins_dir = temp_home.path().join("opencode-config/plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    fs::write(
+        plugins_dir.join("worktrunk.ts"),
+        "// outdated plugin content\n",
+    )
+    .unwrap();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+#[case(None, "Plugin not installed")]
+#[case(Some("// outdated hook content\n"), "Plugin outdated")]
+#[case(Some(include_str!("../../dev/omp-hook.ts")), "Plugin installed")]
+fn test_config_show_omp_hook_status(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] plugin_content: Option<&str>,
+    #[case] expected_status: &str,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    let plugin_path = temp_home.path().join(".omp/agent/hooks/pre/worktrunk.ts");
+    if let Some(content) = plugin_content {
+        fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+        fs::write(&plugin_path, content).unwrap();
+    }
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "show"]).current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "1");
+    cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "0");
+
+    let output = cmd.output().expect("config show should run");
+    assert!(output.status.success(), "config show failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("OH-MY-PI"),
+        "missing oh-my-pi section: {stdout}"
+    );
+    assert!(
+        stdout.contains(expected_status),
+        "missing oh-my-pi status: {stdout}"
+    );
+    // Installed is the one state with nothing to do, so it carries no hint.
+    if expected_status != "Plugin installed" {
+        assert!(
+            stdout.contains("wt config plugins omp install"),
+            "missing oh-my-pi install hint: {stdout}"
+        );
+    }
+}
+
+#[rstest]
+#[case(None, "Plugin not installed")]
+#[case(Some("// outdated extension content\n"), "Plugin outdated")]
+#[case(Some(include_str!("../../dev/pi-extension.ts")), "Plugin installed")]
+fn test_config_show_pi_extension_status(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] plugin_content: Option<&str>,
+    #[case] expected_status: &str,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    let plugin_path = temp_home.path().join(".pi/agent/extensions/worktrunk.ts");
+    if let Some(content) = plugin_content {
+        fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+        fs::write(&plugin_path, content).unwrap();
+    }
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "show"]).current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "1");
+    // Each Pi-family section renders from its own agent, so pin the other
+    // off rather than leaving it to the developer's PATH.
+    cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "0");
+
+    let output = cmd.output().expect("config show should run");
+    assert!(output.status.success(), "config show failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PI"), "missing Pi section: {stdout}");
+    assert!(
+        !stdout.contains("OH-MY-PI"),
+        "oh-my-pi section should not render: {stdout}"
+    );
+    assert!(
+        stdout.contains(expected_status),
+        "missing Pi status: {stdout}"
+    );
+    // Installed is the one state with nothing to do, so it carries no hint.
+    if expected_status != "Plugin installed" {
+        assert!(
+            stdout.contains("wt config plugins pi install"),
+            "missing Pi install hint: {stdout}"
+        );
+    }
+}
+
+#[rstest]
+fn test_config_show_gemini_available_extension_not_installed(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock gemini as available (but extension not installed)
+    repo.setup_mock_gemini_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_config_show_gemini_extension_installed(mut repo: TestRepo, temp_home: TempDir) {
+    // Setup mock gh/glab for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Setup mock gemini CLI listing the worktrunk extension
+    repo.setup_mock_gemini_with_extension_installed();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Each `is_*_available()` short-circuits on the `WORKTRUNK_TEST_*_INSTALLED`
+/// override the harness sets, so the production `which::which` PATH lookup is
+/// otherwise never exercised. `setup_mock_clis_on_path()` drops the overrides
+/// and prepends real mock executables, so this single run covers the
+/// PATH-detection path for all six AI CLIs at once.
+#[rstest]
+fn test_config_show_clis_detected_via_path(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_clis_on_path();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+// =============================================================================
+// OpenCode plugin install/uninstall
+// =============================================================================
+
+/// Fresh install writes the plugin to the expected path.
+#[rstest]
+fn test_opencode_install_creates_plugin(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join("opencode-config/plugins/worktrunk.ts");
+    assert!(
+        plugin_path.exists(),
+        "Plugin file should exist after install"
+    );
+    let content = fs::read_to_string(&plugin_path).unwrap();
+    assert!(
+        content.contains("session.status"),
+        "Plugin should contain event handler"
+    );
+}
+
+/// When the plugin is already installed with current content, show info message.
+#[rstest]
+fn test_opencode_install_already_installed(temp_home: TempDir) {
+    // Pre-install the plugin
+    TestRepo::setup_opencode_plugin_installed(temp_home.path());
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// When an outdated plugin exists, install replaces it with current content.
+#[rstest]
+fn test_opencode_install_updates_outdated(temp_home: TempDir) {
+    // Write an outdated plugin file
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugins_dir = canonical_home.join("opencode-config/plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    fs::write(plugins_dir.join("worktrunk.ts"), "// outdated\n").unwrap();
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // Verify content was updated
+    let content = fs::read_to_string(plugins_dir.join("worktrunk.ts")).unwrap();
+    assert!(
+        content.contains("session.status"),
+        "Plugin should be updated to current content"
+    );
+}
+
+/// Uninstall removes the plugin file.
+#[rstest]
+fn test_opencode_uninstall_removes_plugin(temp_home: TempDir) {
+    // Pre-install the plugin
+    TestRepo::setup_opencode_plugin_installed(temp_home.path());
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join("opencode-config/plugins/worktrunk.ts");
+    assert!(plugin_path.exists(), "Plugin should exist before uninstall");
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "opencode", "uninstall", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(
+        !plugin_path.exists(),
+        "Plugin file should be removed after uninstall"
+    );
+}
+
+/// Uninstall when not installed shows info message.
+#[rstest]
+fn test_opencode_uninstall_not_installed(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "opencode", "uninstall", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Install honours `XDG_CONFIG_HOME` when `OPENCODE_CONFIG_DIR` is unset.
+///
+/// Cross-platform: OpenCode's documented global-config location is
+/// `~/.config/opencode/` (or `$XDG_CONFIG_HOME/opencode/`) on every OS, so the
+/// plugin must land at `{temp_home}/.config/opencode/plugins/worktrunk.ts`
+/// regardless of platform. Previously this test was Linux-only because the
+/// implementation called `dirs::config_dir()`, which on macOS returns
+/// `~/Library/Application Support` (the *managed* settings path, not the
+/// plugin path) — see #2654.
+#[rstest]
+fn test_opencode_install_uses_xdg_config_home(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        // Remove OPENCODE_CONFIG_DIR so the code falls through to XDG_CONFIG_HOME
+        cmd.env_remove("OPENCODE_CONFIG_DIR");
+        cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    // set_temp_home_env sets XDG_CONFIG_HOME = $HOME/.config
+    let plugin_path = canonical_home.join(".config/opencode/plugins/worktrunk.ts");
+    assert!(
+        plugin_path.exists(),
+        "Plugin file should exist at XDG_CONFIG_HOME fallback path: {}",
+        plugin_path.display()
+    );
+}
+
+/// Install defaults to `$HOME/.config/opencode/plugins/` when neither
+/// `OPENCODE_CONFIG_DIR` nor `XDG_CONFIG_HOME` is set.
+///
+/// Cross-platform regression guard for #2654: with the previous
+/// `dirs::config_dir()`-based fallback, this test passed on Linux (XDG default)
+/// but failed on macOS (`~/Library/Application Support`). After the fix, the
+/// fallback is `$HOME/.config/opencode/plugins/worktrunk.ts` on every OS, in
+/// line with OpenCode's own global-config precedence.
+#[rstest]
+fn test_opencode_install_defaults_to_home_dot_config(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env_remove("OPENCODE_CONFIG_DIR");
+    cmd.env_remove("XDG_CONFIG_HOME");
+    cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join(".config/opencode/plugins/worktrunk.ts");
+    assert!(
+        plugin_path.exists(),
+        "Plugin should default to $HOME/.config/opencode/plugins/worktrunk.ts but file not found at: {}",
+        plugin_path.display(),
+    );
+}
+
+/// An exported-but-empty `OPENCODE_CONFIG_DIR` reads as unset, not as a
+/// directory named `""`.
+///
+/// Regression guard: the empty value used to be taken at face value, so the
+/// install target collapsed to the relative path `plugins/worktrunk.ts` and
+/// the plugin was written into whatever directory `wt` was run from — with
+/// `is_plugin_installed()` then reading it back from there, so the install
+/// reported success while OpenCode never saw the plugin.
+#[rstest]
+fn test_opencode_install_treats_empty_config_dir_as_unset(temp_home: TempDir) {
+    let run_dir = temp_home.path().join("run-from-here");
+    fs::create_dir_all(&run_dir).unwrap();
+
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("OPENCODE_CONFIG_DIR", "");
+    cmd.current_dir(&run_dir);
+    cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    // set_temp_home_env sets XDG_CONFIG_HOME = $HOME/.config, which is the next
+    // rung down the precedence once the empty override is discarded.
+    let plugin_path = canonical_home.join(".config/opencode/plugins/worktrunk.ts");
+    assert!(
+        plugin_path.exists(),
+        "Plugin should fall through to the XDG path, but not found at: {}",
+        plugin_path.display(),
+    );
+    assert!(
+        !run_dir.join("plugins").exists(),
+        "Plugin must not be written relative to the invocation directory"
+    );
+}
+
+/// A relative `$XDG_CONFIG_HOME` is ignored, as the XDG base directory spec
+/// requires, rather than resolved against the invocation directory.
+///
+/// Regression guard for the same shape as the empty `OPENCODE_CONFIG_DIR`
+/// above, one rung down the precedence: `$XDG_CONFIG_HOME` filtered only the
+/// empty string, so `XDG_CONFIG_HOME=relative-config` made the install target
+/// `relative-config/opencode/plugins/worktrunk.ts` — written under whatever
+/// directory `wt` was run from, and read back from there by
+/// `is_plugin_installed()`, so the install reported success while OpenCode
+/// never saw the plugin.
+///
+/// Out-of-process, so `.env()` sets the child's environment and this races
+/// nothing else in the binary.
+#[rstest]
+fn test_opencode_install_ignores_relative_xdg_config_home(temp_home: TempDir) {
+    let run_dir = temp_home.path().join("run-from-here");
+    fs::create_dir_all(&run_dir).unwrap();
+
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env_remove("OPENCODE_CONFIG_DIR");
+    cmd.env("XDG_CONFIG_HOME", "relative-config");
+    cmd.current_dir(&run_dir);
+    cmd.args(["config", "plugins", "opencode", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    // The relative value is discarded, so the `$HOME/.config/opencode` default
+    // applies — the same target the unset case reaches.
+    let plugin_path = canonical_home.join(".config/opencode/plugins/worktrunk.ts");
+    assert!(
+        plugin_path.exists(),
+        "Plugin should fall through to $HOME/.config, but not found at: {}",
+        plugin_path.display(),
+    );
+    assert!(
+        !run_dir.join("relative-config").exists(),
+        "Plugin must not be written relative to the invocation directory"
+    );
+}
+
+/// Install prompt declined (no `--yes`, piped stdin → empty → declined).
+/// Exercises the declined-prompt branch of `install_file_plugin` in config/mod.rs.
+#[rstest]
+fn test_opencode_install_prompt_declined(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        // No --yes, piped stdin sends empty → prompt declines
+        cmd.args(["config", "plugins", "opencode", "install"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join("opencode-config/plugins/worktrunk.ts");
+    assert!(
+        !plugin_path.exists(),
+        "Plugin should NOT be installed when prompt is declined"
+    );
+}
+
+/// Uninstall prompt declined (no `--yes`, piped stdin → empty → declined).
+/// Exercises the declined-prompt branch of `uninstall_file_plugin` in config/mod.rs.
+#[rstest]
+fn test_opencode_uninstall_prompt_declined(temp_home: TempDir) {
+    // Pre-install the plugin so we reach the prompt
+    TestRepo::setup_opencode_plugin_installed(temp_home.path());
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join("opencode-config/plugins/worktrunk.ts");
+    assert!(plugin_path.exists(), "Plugin should exist before test");
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        // No --yes, piped stdin sends empty → prompt declines
+        cmd.args(["config", "plugins", "opencode", "uninstall"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(
+        plugin_path.exists(),
+        "Plugin should still exist when uninstall prompt is declined"
+    );
+}
+
+// =============================================================================
+// oh-my-pi hook install/uninstall
+// =============================================================================
+
+#[rstest]
+fn test_omp_install_creates_profile_aware_hook(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("OMP_PROFILE", "research");
+        cmd.args(["config", "plugins", "omp", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let plugin_path = canonical_home.join(".omp/profiles/research/agent/hooks/pre/worktrunk.ts");
+    let content = fs::read_to_string(&plugin_path).expect("oh-my-pi hook should be installed");
+    assert!(content.contains("agent_start"));
+    assert!(content.contains("agent_end"));
+    assert!(content.contains("session_shutdown"));
+}
+
+#[rstest]
+fn test_omp_install_honors_agent_dir_override(temp_home: TempDir) {
+    let agent_dir = temp_home.path().join("custom-omp-agent");
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+    cmd.args(["config", "plugins", "omp", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(
+        output.status.success(),
+        "install failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(agent_dir.join("hooks/pre/worktrunk.ts").exists());
+}
+
+#[rstest]
+fn test_omp_named_profile_ignores_agent_dir_override(temp_home: TempDir) {
+    let agent_dir = temp_home.path().join("custom-omp-agent");
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("OMP_PROFILE", "research");
+    cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+    cmd.args(["config", "plugins", "omp", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(!agent_dir.join("hooks/pre/worktrunk.ts").exists());
+    assert!(
+        temp_home
+            .path()
+            .join(".omp/profiles/research/agent/hooks/pre/worktrunk.ts")
+            .exists()
+    );
+}
+
+#[rstest]
+fn test_omp_install_honors_profile_and_config_dir(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env_remove("OMP_PROFILE");
+    cmd.env("PI_PROFILE", "research");
+    cmd.env("PI_CONFIG_DIR", ".pi-config");
+    cmd.args(["config", "plugins", "omp", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(
+        temp_home
+            .path()
+            .join(".pi-config/profiles/research/agent/hooks/pre/worktrunk.ts")
+            .exists()
+    );
+}
+
+#[rstest]
+fn test_omp_install_is_idempotent(temp_home: TempDir) {
+    for _ in 0..2 {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "omp", "install", "--yes"]);
+        let output = cmd.output().expect("install command should run");
+        assert!(output.status.success(), "install failed: {output:?}");
+    }
+
+    let plugin_path = temp_home.path().join(".omp/agent/hooks/pre/worktrunk.ts");
+    assert_eq!(
+        fs::read_to_string(plugin_path).unwrap(),
+        include_str!("../../dev/omp-hook.ts")
+    );
+}
+
+#[rstest]
+fn test_omp_install_prompt_declined(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "omp", "install"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(
+        !temp_home
+            .path()
+            .join(".omp/agent/hooks/pre/worktrunk.ts")
+            .exists()
+    );
+}
+
+#[rstest]
+fn test_omp_uninstall_removes_hook(temp_home: TempDir) {
+    let agent_dir = temp_home.path().join(".omp/agent");
+    let plugin_path = agent_dir.join("hooks/pre/worktrunk.ts");
+    fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+    fs::write(&plugin_path, include_str!("../../dev/omp-hook.ts")).unwrap();
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "omp", "uninstall", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(!plugin_path.exists());
+}
+
+#[rstest]
+fn test_omp_uninstall_missing_is_a_no_op(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "omp", "uninstall", "--yes"]);
+
+    let output = cmd.output().expect("uninstall command should run");
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+}
+
+#[rstest]
+fn test_omp_uninstall_prompt_declined(temp_home: TempDir) {
+    let plugin_path = temp_home.path().join(".omp/agent/hooks/pre/worktrunk.ts");
+    fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+    fs::write(&plugin_path, include_str!("../../dev/omp-hook.ts")).unwrap();
+
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "omp", "uninstall"]);
+
+    let output = cmd.output().expect("uninstall command should run");
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+    assert!(plugin_path.exists());
+}
+
+// =============================================================================
+// Pi extension install/uninstall
+// =============================================================================
+
+#[rstest]
+fn test_pi_install_writes_extension(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        // `pi install` redirects when only oh-my-pi resolves, so pin both
+        // rather than letting the developer's PATH decide this snapshot.
+        cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "1");
+        cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "0");
+        cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    let canonical_home =
+        crate::common::canonicalize(temp_home.path()).unwrap_or_else(|_| temp_home.path().into());
+    let extension_path = canonical_home.join(".pi/agent/extensions/worktrunk.ts");
+    let content = fs::read_to_string(&extension_path).expect("Pi extension should be installed");
+    assert!(content.contains("@earendil-works/pi-coding-agent"));
+    assert!(content.contains("agent_start"));
+    // `agent_settled`, not `agent_end`: Pi documents the former as the event a
+    // status integration waits for, because it may still auto-retry after the
+    // latter. oh-my-pi's hook API has no equivalent and keeps `agent_end`.
+    assert!(content.contains(r#"pi.on("agent_settled""#));
+    assert!(content.contains("session_shutdown"));
+}
+
+#[rstest]
+fn test_pi_install_honors_agent_dir_override(temp_home: TempDir) {
+    let agent_dir = temp_home.path().join("custom-pi-agent");
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
+    cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(agent_dir.join("extensions/worktrunk.ts").exists());
+
+    // Pi expands a leading `~` in the override, so a quoted `~/…` lands under
+    // home rather than in a literal `~` directory beneath the cwd.
+    let cwd = tempfile::tempdir().unwrap();
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.current_dir(cwd.path());
+    cmd.env("PI_CODING_AGENT_DIR", "~/tilde-pi-agent");
+    cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(
+        temp_home
+            .path()
+            .join("tilde-pi-agent/extensions/worktrunk.ts")
+            .exists()
+    );
+    assert!(!cwd.path().join("~").exists());
+}
+
+/// Pi has no profile concept: the oh-my-pi profile variables must not move the
+/// extension into a `profiles/` subtree.
+#[rstest]
+fn test_pi_install_ignores_omp_profile_variables(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("OMP_PROFILE", "research");
+    cmd.env("PI_PROFILE", "research");
+    cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(
+        temp_home
+            .path()
+            .join(".pi/agent/extensions/worktrunk.ts")
+            .exists()
+    );
+    assert!(!temp_home.path().join(".pi/agent/profiles").exists());
+}
+
+#[rstest]
+fn test_pi_install_is_idempotent(temp_home: TempDir) {
+    for _ in 0..2 {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+        let output = cmd.output().expect("install command should run");
+        assert!(output.status.success(), "install failed: {output:?}");
+    }
+
+    let extension_path = temp_home.path().join(".pi/agent/extensions/worktrunk.ts");
+    assert_eq!(
+        fs::read_to_string(extension_path).unwrap(),
+        include_str!("../../dev/pi-extension.ts")
+    );
+}
+
+/// `pi install` meant oh-my-pi until the split, and a stray Pi extension has
+/// no surface in `wt config show` — so the command says so itself when only
+/// oh-my-pi is on PATH.
+#[rstest]
+fn test_pi_install_points_at_omp_when_only_omp_is_on_path(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "1");
+        cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "0");
+        cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// With Pi itself on PATH the command has nothing to redirect, whatever else
+/// is installed alongside it.
+#[rstest]
+fn test_pi_install_stays_quiet_when_pi_is_on_path(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "1");
+    cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "1");
+    cmd.args(["config", "plugins", "pi", "install", "--yes"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("wt config plugins omp install"),
+        "unexpected oh-my-pi redirect: {stderr}"
+    );
+}
+
+/// The redirect prints before the install prompt, so the blank line between
+/// them belongs to the prompt. Declined here (no `--yes`, piped stdin → empty),
+/// which is the only path that renders both.
+#[rstest]
+fn test_pi_install_redirect_precedes_the_prompt(temp_home: TempDir) {
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_TEST_OMP_INSTALLED", "1");
+        cmd.env("WORKTRUNK_TEST_PI_INSTALLED", "0");
+        cmd.args(["config", "plugins", "pi", "install"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(
+        !temp_home
+            .path()
+            .join(".pi/agent/extensions/worktrunk.ts")
+            .exists()
+    );
+}
+
+#[rstest]
+fn test_pi_install_prompt_declined(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "pi", "install"]);
+
+    let output = cmd.output().expect("install command should run");
+    assert!(output.status.success(), "install failed: {output:?}");
+    assert!(
+        !temp_home
+            .path()
+            .join(".pi/agent/extensions/worktrunk.ts")
+            .exists()
+    );
+}
+
+#[rstest]
+fn test_pi_uninstall_removes_extension(temp_home: TempDir) {
+    let extension_path = temp_home.path().join(".pi/agent/extensions/worktrunk.ts");
+    fs::create_dir_all(extension_path.parent().unwrap()).unwrap();
+    fs::write(&extension_path, include_str!("../../dev/pi-extension.ts")).unwrap();
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "pi", "uninstall", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(!extension_path.exists());
+}
+
+#[rstest]
+fn test_pi_uninstall_missing_is_a_no_op(temp_home: TempDir) {
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "pi", "uninstall", "--yes"]);
+
+    let output = cmd.output().expect("uninstall command should run");
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+}
+
+/// `pi uninstall` used to remove the oh-my-pi hook, so anyone repeating that
+/// command after the split gets "Plugin not installed" for a hook that is
+/// still there. The hint names the command that removes it.
+#[rstest]
+fn test_pi_uninstall_points_at_omp_when_its_hook_remains(temp_home: TempDir) {
+    let hook_path = temp_home.path().join(".omp/agent/hooks/pre/worktrunk.ts");
+    fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+    fs::write(&hook_path, include_str!("../../dev/omp-hook.ts")).unwrap();
+
+    let settings = setup_home_snapshot_settings(&temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.args(["config", "plugins", "pi", "uninstall", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(
+        hook_path.exists(),
+        "pi uninstall must not touch the oh-my-pi hook"
+    );
+}
+
+#[rstest]
+fn test_pi_uninstall_prompt_declined(temp_home: TempDir) {
+    let extension_path = temp_home.path().join(".pi/agent/extensions/worktrunk.ts");
+    fs::create_dir_all(extension_path.parent().unwrap()).unwrap();
+    fs::write(&extension_path, include_str!("../../dev/pi-extension.ts")).unwrap();
+
+    let mut cmd = wt_command();
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "plugins", "pi", "uninstall"]);
+
+    let output = cmd.output().expect("uninstall command should run");
+    assert!(output.status.success(), "uninstall failed: {output:?}");
+    assert!(extension_path.exists());
+}
+
+/// When $SHELL is not set but PSModulePath is, config show should display
+/// "Detected shell: powershell" in the diagnostics and show the verification hint.
+#[rstest]
+fn test_config_show_powershell_detected_via_psmodulepath(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Create global config
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create .bashrc with wt integration
+    fs::write(
+        temp_home.path().join(".bashrc"),
+        r#"if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init bash)"; fi
+"#,
+    )
+    .unwrap();
+
+    // Create PowerShell profile with wt integration (covers Get-Command hint branch)
+    // Must use the canonical config line (what `wt config shell install` writes)
+    let ps_profile_dir = temp_home.path().join(".config").join("powershell");
+    fs::create_dir_all(&ps_profile_dir).unwrap();
+    fs::write(
+        ps_profile_dir.join("Microsoft.PowerShell_profile.ps1"),
+        "if (Get-Command wt -ErrorAction SilentlyContinue) { Invoke-Expression (& wt config shell init powershell | Out-String) }\n",
+    )
+    .unwrap();
+
+    let mut settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    // PowerShell config state is platform-dependent: the profile path differs between
+    // Windows (Documents\PowerShell\) and Unix (~/.config/powershell/). The broad
+    // PowerShell filter strips status lines, but the Get-Command hint and "To configure"
+    // hint also vary by platform (present only when profile is found). Filter them too.
+    settings.add_filter(r"(?m)^.*Get-Command.*\n", "");
+    settings.add_filter(r"(?m)^.*To configure, run.*\n", "");
+    // Collapse triple newlines that may result from stripping adjacent lines
+    settings.add_filter(r"\n\n\n", "\n\n");
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        // Enable PowerShell scanning so the profile above is detected
+        cmd.env("WORKTRUNK_TEST_POWERSHELL_ENV", "1");
+        // Ensure SHELL is NOT set (already removed by configure_cli_command)
+        cmd.env_remove("SHELL");
+        // Set PSModulePath to trigger PowerShell detection fallback
+        cmd.env(
+            "PSModulePath",
+            r"C:\Users\user\Documents\PowerShell\Modules",
+        );
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The process-tree shell wins over $SHELL in the diagnostics: with zsh as
+/// the detected ancestor and bash as the login shell, config show surfaces
+/// "Detected shell: zsh (process tree)" next to $SHELL, and the verify hint
+/// targets zsh.
+#[rstest]
+fn test_config_show_detected_shell_via_process_tree(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // .zshrc has integration for the shell the process tree detects
+    fs::write(
+        temp_home.path().join(".zshrc"),
+        r#"if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init zsh)"; fi
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        // Login shell differs from the process-tree ancestor. The override
+        // must come after configure_wt_cmd, which pins it to "".
+        cmd.env("SHELL", "/bin/bash");
+        cmd.env("WORKTRUNK_TEST_PARENT_SHELL", "zsh");
+        cmd.env("WORKTRUNK_TEST_COMPINIT_CONFIGURED", "1");
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Without the test override, the real process-tree walk runs. Its result
+/// depends on the environment (dev shell, CI runner), so this asserts only
+/// that the walk completes and config show still renders — exercising the
+/// production walk end-to-end rather than the override shortcut.
+#[rstest]
+fn test_config_show_runs_real_ancestry_walk(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    let mut cmd = repo.wt_command();
+    cmd.arg("config").arg("show").current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    cmd.env_remove("WORKTRUNK_TEST_PARENT_SHELL");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "config show should succeed with the real walk: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Shell integration"),
+        "shell section should render: {stdout}"
+    );
+}
+
+/// Test that deprecated [commit-generation] section shows warning and that
+/// `wt config update` migrates it in place
+#[rstest]
+fn test_deprecated_commit_generation_section_shows_warning(repo: TestRepo, temp_home: TempDir) {
+    // Write user config with deprecated [commit-generation] section
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[commit-generation]
+command = "llm"
+args = ["-m", "haiku"]
+"#,
+    )
+    .unwrap();
+
+    // Use `wt list` which loads config through UserConfig::load() and triggers deprecation check
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // Drive the migration explicitly via `wt config update`; `wt list` only warns.
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    assert!(cmd.output().unwrap().status.success());
+
+    let migrated = fs::read_to_string(config_path).unwrap();
+    assert!(
+        migrated.contains("[commit.generation]"),
+        "Should rename [commit-generation] to [commit.generation]"
+    );
+    assert!(
+        migrated.contains("command = \"llm -m haiku\""),
+        "Should merge args into command"
+    );
+    assert!(!migrated.contains("[commit-generation]"));
+    assert!(!migrated.contains("args ="));
+}
+
+/// Test that deprecated project-level [projects."...".commit-generation] shows warning
+#[rstest]
+fn test_deprecated_commit_generation_project_level_shows_warning(
+    repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Write user config with deprecated project-level commit-generation
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[projects."github.com/example/repo".commit-generation]
+command = "llm -m gpt-4"
+"#,
+    )
+    .unwrap();
+
+    // Use `wt list` which loads config through UserConfig::load() and triggers deprecation check
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // Drive the migration explicitly via `wt config update`; `wt list` only warns.
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    assert!(cmd.output().unwrap().status.success());
+
+    let migrated = fs::read_to_string(config_path).unwrap();
+    assert!(
+        migrated.contains("[projects.\"github.com/example/repo\".commit.generation]"),
+        "Should rename project-level section"
+    );
+}
+
+/// Test that `wt config show` displays full deprecation details including inline diff
+#[rstest]
+fn test_config_show_displays_deprecation_details(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Write user config with deprecated variables at XDG path
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+pre-start = "ln -sf {{ repo_root }}/node_modules"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // `wt config show` renders the diff in memory — nothing persists on disk.
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "wt config show must not leave a .new file behind"
+    );
+}
+
+/// Test that `wt config show` from linked worktree shows hint to run from main worktree
+///
+/// When project config has deprecations and you run from a linked worktree, it should
+/// show a hint to run `wt config show` from the main worktree.
+#[rstest]
+fn test_config_show_from_linked_worktree_shows_main_worktree_hint(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Setup mock gh/glab/claude for deterministic output
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Write project config with deprecated variables
+    let project_config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&project_config_dir).unwrap();
+    fs::write(
+        project_config_dir.join("wt.toml"),
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#,
+    )
+    .unwrap();
+    repo.commit("Add deprecated project config");
+
+    // Create a linked worktree using git directly
+    let feature_path = repo.root_path().parent().unwrap().join("feature-test");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        feature_path.to_str().unwrap(),
+        "-b",
+        "feature-test",
+    ]);
+
+    // Run wt config show from the linked worktree
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(&feature_path);
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Test that `wt config show` displays project-level commit-generation deprecations
+#[rstest]
+fn test_config_show_displays_project_commit_generation_deprecations(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+
+    // Write user config with deprecated project-level commit-generation
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    let config_path = global_config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[projects."github.com/example/repo".commit-generation]
+command = "llm -m gpt-4"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.arg("config").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        set_xdg_config_path(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // `wt config show` renders the diff in memory — nothing persists on disk.
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "wt config show must not leave a .new file behind"
+    );
+}
+
+/// Test that deprecated approved-commands in [projects] sections are copied to approvals.toml
+#[rstest]
+fn test_config_update_copies_approved_commands_to_approvals_file(
+    repo: TestRepo,
+    temp_home: TempDir,
+) {
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[projects."github.com/user/repo"]
+approved-commands = ["npm install", "npm test"]
+"#,
+    )
+    .unwrap();
+
+    // Passive load must NOT copy approvals or modify the config.
+    {
+        let mut cmd = repo.wt_command();
+        cmd.arg("list").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+        assert!(cmd.output().unwrap().status.success());
+    }
+    assert!(
+        !config_path.with_file_name("approvals.toml").exists(),
+        "wt list must not copy approvals"
+    );
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "wt list must not write .new file"
+    );
+
+    // `wt config update --yes` migrates in place: config.toml is rewritten
+    // without approved-commands, and approvals.toml is created alongside it.
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "config update should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let migrated = fs::read_to_string(config_path).unwrap();
+    assert!(
+        !migrated.contains("approved-commands"),
+        "config.toml should no longer contain approved-commands: {migrated}"
+    );
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "config update must not leave a .new file behind"
+    );
+
+    let approvals_file = config_path.with_file_name("approvals.toml");
+    assert!(approvals_file.exists(), "approvals.toml should be created");
+    let approvals = fs::read_to_string(&approvals_file).unwrap();
+    assert!(
+        approvals.contains("npm install") && approvals.contains("npm test"),
+        "approvals.toml should carry both commands: {approvals}"
+    );
+}
+
+/// A deprecated section carrying a key its replacement has no field for must
+/// not have that key relocated: `[switch.picker]` has only `pager`, so a
+/// `[select] height` written into it would warn as an unknown field on every
+/// later command, for a key the user never typed and no `wt config update` can
+/// clear. The migration drops it and says so instead, leaving a config that
+/// loads clean.
+#[rstest]
+fn test_config_update_drops_keys_the_replacement_cannot_hold(repo: TestRepo, temp_home: TempDir) {
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"[select]
+pager = "delta"
+height = "50%"
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(
+        output.status.success(),
+        "config update should succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("[select] height is no longer supported"),
+        "the unsupported key must be reported: {stderr}"
+    );
+
+    let migrated = fs::read_to_string(config_path).unwrap();
+    assert!(
+        migrated.contains("[switch.picker]") && migrated.contains(r#"pager = "delta""#),
+        "the supported key should migrate: {migrated}"
+    );
+    assert!(
+        !migrated.contains("height"),
+        "the unsupported key should be dropped, not relocated: {migrated}"
+    );
+
+    // The loop closes: the rewritten config warns about nothing.
+    let mut cmd = repo.wt_command();
+    cmd.arg("list").current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", config_path);
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(output.status.success(), "wt list should succeed: {stderr}");
+    assert!(
+        !stderr.contains("unknown field"),
+        "updated config must not warn on load: {stderr}"
+    );
+}
+
+// ==================== config update tests ====================
+
+/// `wt config update` migrates project config in place (from the main
+/// worktree). Covers the project-config path in `check_project_config`.
+#[rstest]
+fn test_config_update_applies_project_config_migration(repo: TestRepo) {
+    repo.write_project_config(
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#,
+    );
+    repo.commit("Add deprecated project config");
+    let project_config_path = repo.root_path().join(".config").join("wt.toml");
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "config update should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let updated = fs::read_to_string(&project_config_path).unwrap();
+    assert!(updated.contains("pre-start"));
+    assert!(updated.contains("{{ repo }}"));
+    assert!(!updated.contains("main_worktree"));
+}
+
+/// `wt config update` from a linked worktree declines to mutate project
+/// config and instead points at the main worktree. Covers the `is_linked`
+/// branch in `check_project_config`.
+#[rstest]
+fn test_config_update_project_config_from_linked_worktree_shows_hint(repo: TestRepo) {
+    repo.write_project_config(
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#,
+    );
+    repo.commit("Add deprecated project config");
+    let project_config_path = repo.root_path().join(".config").join("wt.toml");
+    let before = fs::read_to_string(&project_config_path).unwrap();
+
+    let feature_path = repo.root_path().parent().unwrap().join("feature-test");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        feature_path.to_str().unwrap(),
+        "-b",
+        "feature-test",
+    ]);
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--yes"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("To update project config:"),
+        "Should hint at main worktree, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&project_config_path).unwrap(),
+        before,
+        "Project config must not change when run from linked worktree"
+    );
+}
+
+/// Multiple migrated configs can be inspected on stdout but cannot be written
+/// as one config file, which would change TOML table scope between documents.
+#[rstest]
+fn test_config_update_output_file_rejects_multiple_configs(repo: TestRepo) {
+    let user_config_path = repo.test_config_path();
+    let user_original = r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#;
+    fs::write(user_config_path, user_original).unwrap();
+    let project_original = r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#;
+    repo.write_project_config(project_original);
+    repo.commit("Add deprecated project config");
+
+    let stdout_output = repo
+        .wt_command()
+        .args(["config", "update", "--output=-"])
+        .output()
+        .unwrap();
+    assert!(stdout_output.status.success());
+    assert!(stdout_output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&stdout_output.stdout);
+    assert!(stdout.contains("# User config"));
+    assert!(stdout.contains("# Project config"));
+    assert!(stdout.contains("{{ repo }}"));
+    assert!(stdout.contains("pre-start"));
+
+    fs::write(
+        repo.root_path().join("migrated.toml"),
+        "important user data\n",
+    )
+    .unwrap();
+    let mut file_command = repo.wt_command();
+    file_command
+        .current_dir(repo.root_path().parent().unwrap())
+        .arg("-C")
+        .arg(repo.root_path())
+        .args(["config", "update", "--output=migrated.toml"]);
+    let file_output = file_command.output().unwrap();
+    assert!(!file_output.status.success());
+    assert!(file_output.stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("migrated.toml")).unwrap(),
+        "important user data\n"
+    );
+    let stderr = String::from_utf8_lossy(&file_output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(
+        stderr.contains("Cannot write user config and project config migrations to one file"),
+        "unexpected stderr: {stderr}"
+    );
+    assert_eq!(fs::read_to_string(user_config_path).unwrap(), user_original);
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join(".config").join("wt.toml")).unwrap(),
+        project_original
+    );
+}
+
+/// File and stdout output receive the same bytes for one migrated config.
+#[rstest]
+fn test_config_update_output_destinations_emit_same_config(repo: TestRepo) {
+    let config_path = repo.test_config_path();
+    let original = r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#;
+    fs::write(config_path, original).unwrap();
+
+    let stdout_output = repo
+        .wt_command()
+        .args(["config", "update", "--output=-"])
+        .output()
+        .unwrap();
+    assert!(stdout_output.status.success());
+    assert!(stdout_output.stderr.is_empty());
+
+    let destination = repo.root_path().join("migrated.toml");
+    let file_output = repo
+        .wt_command()
+        .args(["config", "update", "--output=migrated.toml"])
+        .output()
+        .unwrap();
+    assert!(file_output.status.success());
+    assert!(file_output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&file_output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(
+        stderr.contains("Wrote user config migration @") && stderr.contains("migrated.toml"),
+        "a file destination confirms the write, unlike stdout; got: {stderr}"
+    );
+    assert_eq!(fs::read(destination).unwrap(), stdout_output.stdout);
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+}
+
+/// `wt config update --output=-` on a clean config exits silently with empty
+/// stdout — no "nothing to do" noise to corrupt a pipe.
+#[rstest]
+fn test_config_update_output_stdout_on_clean_config_is_silent(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[list]
+json-schema = 1
+"#,
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output", "-"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must be empty on clean config"
+    );
+}
+
+/// File output with no migrations leaves an existing destination untouched.
+#[rstest]
+fn test_config_update_output_file_on_clean_config_preserves_destination(repo: TestRepo) {
+    let config_path = repo.test_config_path();
+    let original = r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[list]
+json-schema = 1
+"#;
+    fs::write(config_path, original).unwrap();
+
+    let destination = repo.root_path().join("migrated.toml");
+    fs::write(&destination, "important user data\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output=migrated.toml"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No deprecated settings found"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        "important user data\n"
+    );
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+}
+
+/// File output reports the destination when its parent directory is missing.
+#[rstest]
+fn test_config_update_output_file_surfaces_write_failure(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#,
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args([
+            "config",
+            "update",
+            "--output=missing-directory/migrated.toml",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to write output @")
+            && stderr.contains("missing-directory/migrated.toml"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+/// `wt config update --output=-` emits the migrated TOML to stdout without
+/// touching the config file. Stderr stays empty so the output is pipeable.
+#[rstest]
+fn test_config_update_output_stdout_emits_migrated_without_writing(repo: TestRepo) {
+    let config_path = repo.test_config_path();
+    let original = r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#;
+    fs::write(config_path, original).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output=-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "config update --output=- should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "--output=- must keep stderr empty for pipe-friendliness, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("{{ repo }}") && !stdout.contains("{{ main_worktree }}"),
+        "stdout should contain migrated content, got: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(config_path).unwrap(),
+        original,
+        "--output=- must not modify the config file"
+    );
+    assert!(
+        !config_path.with_extension("toml.new").exists(),
+        "--output=- must not write a .new file"
+    );
+}
+
+/// Read-only output includes project config from a linked worktree without
+/// changing either checkout's copy.
+#[rstest]
+fn test_config_update_output_stdout_from_linked_worktree(repo: TestRepo) {
+    repo.write_project_config(
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#,
+    );
+    repo.commit("Add deprecated project config");
+
+    let project_config_path = repo.root_path().join(".config").join("wt.toml");
+    let before = fs::read_to_string(&project_config_path).unwrap();
+    let feature_path = repo.root_path().parent().unwrap().join("feature-output");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        feature_path.to_str().unwrap(),
+        "-b",
+        "feature-output",
+    ]);
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output=-"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{{ repo }}"));
+    assert!(!stdout.contains("{{ main_worktree }}"));
+    assert_eq!(
+        fs::read_to_string(feature_path.join(".config").join("wt.toml")).unwrap(),
+        before,
+        "linked-worktree project config must remain unchanged"
+    );
+    assert_eq!(
+        fs::read_to_string(project_config_path).unwrap(),
+        before,
+        "main-worktree project config must remain unchanged"
+    );
+}
+
+/// The former output flag is no longer accepted.
+#[rstest]
+fn test_config_update_rejects_print(repo: TestRepo) {
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--print"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(
+        stderr.contains("unexpected argument '--print'"),
+        "unexpected error: {stderr}"
+    );
+}
+
+#[rstest]
+fn test_config_update_output_warns_about_dropped_approvals(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        r#"[list]
+json-schema = 1
+
+[projects."github.com/user/repo"]
+approved-commands = ["npm ci", "npm test"]
+
+[projects."github.com/other/repo"]
+approved-commands = ["cargo test"]
+"#,
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output=-"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.ansi_strip();
+    assert!(
+        stderr.contains("approved-commands") && stderr.contains("wt config update"),
+        "stderr should explain how to preserve approvals, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("approved-commands"),
+        "the printed config drops them, got: {stdout}"
+    );
+}
+
+/// `--output` writes the path it was given, including the config being
+/// migrated. That write drops the config's `approved-commands`, so they move to
+/// approvals.toml first, exactly as the in-place update moves them — warning
+/// instead would point at a `wt config update` with nothing left to migrate.
+#[rstest]
+fn test_config_update_output_writes_the_config_it_migrates(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+
+[projects."github.com/user/repo"]
+approved-commands = ["npm test"]
+"#,
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--output"])
+        .arg(repo.test_config_path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = fs::read_to_string(repo.test_config_path()).unwrap();
+    assert!(
+        written.contains("{{ repo }}") && !written.contains("approved-commands"),
+        "the migration should land at the path it named:\n{written}"
+    );
+    let approvals = fs::read_to_string(repo.test_config_path().with_file_name("approvals.toml"))
+        .expect("approvals.toml should carry the commands the write removed");
+    assert!(
+        approvals.contains("npm test"),
+        "the approvals should survive the overwrite:\n{approvals}"
+    );
+}
+
+/// An existing destination is replaced, the way `cp` and a shell redirect do —
+/// here the user config, which has nothing to migrate but sits at the path a
+/// project-config migration was sent to.
+#[rstest]
+fn test_config_update_output_replaces_an_existing_file(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[aliases]
+hi = "echo hi"
+"#,
+    )
+    .unwrap();
+    repo.write_project_config(
+        r#"pre-start = "ln -sf {{ main_worktree }}/node_modules"
+"#,
+    );
+    repo.commit("Add deprecated project config");
+
+    let overwritten = repo
+        .wt_command()
+        .args(["config", "update", "--output"])
+        .arg(repo.test_config_path())
+        .output()
+        .unwrap();
+    assert!(
+        overwritten.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&overwritten.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        "pre-start = \"ln -sf {{ repo }}/node_modules\"\n"
+    );
+}
+
+/// `wt config update` with no deprecated settings reports nothing to do
+#[rstest]
+fn test_config_update_no_deprecations(repo: TestRepo) {
+    // Clean config: no deprecated patterns, json-schema explicitly set
+    fs::write(
+        repo.test_config_path(),
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[list]
+json-schema = 1
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "update", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Retired settings are ordinary unknown fields: loading warns, while
+/// `wt config update` leaves the file untouched instead of treating them as
+/// migrations it still owns.
+#[rstest]
+fn test_config_update_leaves_retired_keys_for_unknown_field_warnings(repo: TestRepo) {
+    let content = r#"[commit.generation]
+template-file = "/tmp/commit-template"
+squash-template-file = "/tmp/squash-template"
+
+[switch.picker]
+timeout-ms = 500
+
+[list]
+json-schema = 1
+"#;
+    fs::write(repo.test_config_path(), content).unwrap();
+
+    let load_output = repo.wt_command().arg("list").output().unwrap();
+    assert!(
+        load_output.status.success(),
+        "config load should succeed: {}",
+        String::from_utf8_lossy(&load_output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&load_output.stderr);
+    for key in [
+        "commit.generation.template-file",
+        "commit.generation.squash-template-file",
+        "switch.picker.timeout-ms",
+    ] {
+        assert!(
+            stderr.contains("has unknown field") && stderr.contains(key),
+            "expected an unknown-field warning for {key}, got: {stderr}"
+        );
+    }
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "config update should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No deprecated settings found"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        content
+    );
+}
+
+/// `wt config update` leaves `[list] json-schema` unset now that schema 2 is
+/// the default.
+#[rstest]
+fn test_config_update_leaves_json_schema_unset(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "update", "--yes"]);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n"
+    );
+}
+
+/// Updating another deprecated setting does not materialize the default JSON
+/// schema in the user config.
+#[rstest]
+fn test_config_update_does_not_materialize_json_schema(repo: TestRepo) {
+    fs::write(repo.test_config_path(), "[merge]\nno-ff = true\n").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "update", "--yes"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+
+    assert_eq!(
+        fs::read_to_string(repo.test_config_path()).unwrap(),
+        "[merge]\nff = false\n",
+        "the no-ff rewrite applies; the json-schema write must not"
+    );
+}
+
+/// `wt config update` migrates the deprecated `commits` squash-template
+/// variable to `commit_details` (see #2984). The rewrite is a plain identifier
+/// rename — the loop variable stays bare — because each `commit_details`
+/// element renders as its subject, so the migrated template renders identically
+/// to the original.
+#[rstest]
+fn test_config_update_migrates_commits_squash_var(repo: TestRepo) {
+    let config_path = repo.test_config_path();
+    fs::write(
+        config_path,
+        r#"[commit.generation]
+squash-template = """
+Combine {{ commits | length }} commits:
+{% for c in commits %}- {{ c }}
+{% endfor %}"""
+"#,
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "update", "--yes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let updated = fs::read_to_string(config_path).unwrap();
+    assert!(
+        updated.contains("{{ commit_details | length }}"),
+        "filter use of commits should migrate: {updated}"
+    );
+    assert!(
+        updated.contains("for c in commit_details"),
+        "loop source should migrate: {updated}"
+    );
+    // The loop variable stays bare — no `.subject` is injected, since the
+    // element renders as its subject on its own.
+    assert!(
+        updated.contains("- {{ c }}"),
+        "loop body should be left untouched: {updated}"
+    );
+    assert!(
+        !updated.contains("{{ commits"),
+        "no deprecated commits reference should remain: {updated}"
+    );
+}
+
+/// A relative `--config` resolves against `-C`, the way git resolves the path
+/// options in its own command line.
+///
+/// Run from outside the repo, so the process cwd and the `-C` directory
+/// disagree: the file is only reachable from the latter.
+#[rstest]
+fn test_explicit_config_path_honors_directory_flag(repo: TestRepo) {
+    fs::write(
+        repo.root_path().join("side-config.toml"),
+        "[list]\nfull = true\n",
+    )
+    .unwrap();
+    let outside = repo.root_path().parent().unwrap().to_path_buf();
+    let root = repo.root_path().to_string_lossy().to_string();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.args([
+        "-C",
+        &root,
+        "--config",
+        "side-config.toml",
+        "config",
+        "show",
+    ])
+    .current_dir(&outside);
+    let output = cmd.output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .ansi_strip()
+        .into_owned();
+    assert!(
+        stdout.contains("full = true"),
+        "config show should report the config named relative to -C:\n{stdout}"
+    );
+}
+
+/// Test that explicitly specified --config path that doesn't exist shows a warning
+#[rstest]
+fn test_explicit_config_path_not_found_shows_warning(repo: TestRepo) {
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("--config")
+            .arg("/nonexistent/worktrunk/config.toml")
+            .arg("list")
+            .current_dir(repo.root_path());
+
+        // Should show warning about missing config file but still succeed
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+// ==================== Plugin Install/Uninstall Tests ====================
+
+#[rstest]
+fn test_plugins_claude_install(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_plugins();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_already_installed(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_plugin_installed();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_claude_not_found(repo: TestRepo) {
+    // Don't call setup_mock_claude_installed — claude CLI not available
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install", "--yes"])
+            .current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_uninstall(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_plugins();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The plugin removal's goal is that the plugin is gone, so Claude Code
+/// listing no plugins is that goal already met. `claude plugin uninstall`
+/// exits non-zero once the plugin is absent, and the command has to succeed
+/// anyway — and go on to the marketplace, which a first `uninstall` that
+/// removed the plugin and then failed on the marketplace leaves behind.
+#[rstest]
+fn test_plugins_claude_uninstall_tolerates_absent_plugin(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_installed();
+    let mock_bin = repo
+        .mock_bin_path()
+        .expect("setup_mock_ci_tools_unauthenticated creates mock-bin");
+    MockConfig::new("claude")
+        .command(
+            "plugin uninstall",
+            MockResponse::exit(1).with_stderr("error: plugin not found\n"),
+        )
+        .command("plugin list", MockResponse::output("[]"))
+        .command("plugin marketplace remove", MockResponse::exit(0))
+        .write(mock_bin);
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+// ==================== Codex Plugin Install/Uninstall Tests ====================
+
+#[rstest]
+fn test_plugins_codex_install(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugins();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_codex_install_codex_not_found(repo: TestRepo) {
+    // Don't call setup_mock_codex_installed — codex CLI not available
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "codex", "install", "--yes"])
+            .current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_codex_uninstall(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugins();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_codex_install_command_fails(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugins_failing();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The marketplace registers but `codex plugin add` fails: the install stops
+/// there rather than reporting a plugin it never installed.
+#[rstest]
+fn test_plugins_codex_install_plugin_add_fails(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugin_ops_failing();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// A PowerShell profile query that INT/TERM cancels stops `config show --full`
+/// at the shell section, before the forge diagnostics probe `gh`.
+#[cfg(unix)]
+#[rstest]
+#[case::sigint("INT", 130)]
+#[case::sigterm("TERM", 143)]
+fn test_config_show_full_stops_after_cancelled_powershell_query(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] signal: &str,
+    #[case] exit_code: i32,
+) {
+    use crate::common::mock_commands::mock_calls;
+    use std::os::unix::fs::PermissionsExt;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/example/repo.git",
+    ]);
+    let pwsh = repo.mock_bin_path().unwrap().join("pwsh");
+    fs::write(&pwsh, format!("#!/bin/sh\nkill -{signal} $$\n")).unwrap();
+    fs::set_permissions(&pwsh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let call_log = TempDir::new().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .args(["config", "show", "--full"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(exit_code),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(mock_calls(call_log.path(), "gh"), Vec::<String>::new());
+}
+
+/// A `pwsh` that fails without being cancelled leaves `config show --full` on
+/// its ordinary path, through to the forge diagnostics.
+#[cfg(unix)]
+#[rstest]
+fn test_config_show_full_continues_after_failed_powershell_query(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    use crate::common::mock_commands::mock_calls;
+    use std::os::unix::fs::PermissionsExt;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/example/repo.git",
+    ]);
+    let pwsh = repo.mock_bin_path().unwrap().join("pwsh");
+    fs::write(&pwsh, "#!/bin/sh\nexit 130\n").unwrap();
+    fs::set_permissions(&pwsh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let call_log = TempDir::new().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .args(["config", "show", "--full"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!mock_calls(call_log.path(), "gh").is_empty());
+}
+
+/// An ordinary shell scan failure — an rc path that can't be read as a file —
+/// reports the shell status as undetermined and carries on to the forge
+/// diagnostics.
+#[cfg(unix)]
+#[rstest]
+fn test_config_show_full_continues_after_failed_shell_scan(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::mock_calls;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/example/repo.git",
+    ]);
+    fs::create_dir(temp_home.path().join(".bashrc")).unwrap();
+
+    let call_log = TempDir::new().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .args(["config", "show", "--full"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("Could not determine shell status"),
+        "{stdout}{stderr}"
+    );
+    assert!(!mock_calls(call_log.path(), "gh").is_empty());
+}
+
+/// Run `wt config plugins <tool> <action>` and accept the prompt, returning the
+/// argv of every `<tool>` the run spawned — argv\[0\] excluded, as `mock_calls`
+/// records it.
+///
+/// The call log is the helper's own directory, so a caller looping over
+/// install and uninstall can't carry install's calls into uninstall's
+/// assertion. It lives outside the repo under test for the reason `mock_calls`
+/// documents: a log in the working tree would leave an untracked file behind
+/// the command being measured.
+fn plugin_calls_when_accepted(
+    repo: &TestRepo,
+    tool: &str,
+    action: &str,
+    home: &std::path::Path,
+) -> Vec<String> {
+    use crate::common::mock_commands::mock_calls;
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let call_log = TempDir::new().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "plugins", tool, action])
+        .current_dir(repo.root_path())
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    set_temp_home_env(&mut cmd, home);
+
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "accepting {tool} {action}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    mock_calls(call_log.path(), tool)
+}
+
+/// The `?` preview lists exactly the commands each Codex plugin subcommand
+/// runs: declining spawns none of them, and accepting spawns exactly those,
+/// so the confirmation the user answers matches what follows it.
+#[rstest]
+fn test_plugins_codex_prompt_previews_commands(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::mock_calls;
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugins();
+
+    // Outside the repo: a call log in the working tree would leave an
+    // untracked file behind the command under test.
+    let call_log = TempDir::new().unwrap();
+
+    for (action, expected) in [
+        (
+            "install",
+            [
+                "codex plugin marketplace add max-sixty/worktrunk",
+                "codex plugin add worktrunk@worktrunk",
+            ],
+        ),
+        (
+            "uninstall",
+            [
+                "codex plugin remove worktrunk@worktrunk",
+                "codex plugin marketplace remove worktrunk",
+            ],
+        ),
+    ] {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", action])
+            .current_dir(repo.root_path())
+            .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        let mut child = cmd.spawn().unwrap();
+        // `?` renders the preview; `n` then declines, so nothing runs.
+        child.stdin.take().unwrap().write_all(b"?\nn\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .ansi_strip()
+            .to_string();
+        // Compare the whole set of previewed commands, not each one in
+        // isolation: a command the preview lists but never runs is exactly
+        // what a per-command `contains` would let through.
+        // The first gutter line shares a line with the prompt, which `eprint!`
+        // leaves unterminated, so slice from each `codex ` rather than
+        // matching the line start.
+        let previewed: Vec<&str> = stderr
+            .lines()
+            .filter_map(|line| line.find("codex ").map(|i| line[i..].trim_end()))
+            .collect();
+        assert_eq!(previewed, expected, "{action} preview: {stderr}");
+        // The preview is only a preview: declining must leave codex unspawned.
+        let calls = mock_calls(call_log.path(), "codex");
+        assert!(
+            calls.is_empty(),
+            "declining {action} must spawn no codex: {calls:#?}"
+        );
+
+        // Both sides of the comparison above are the preview text, so nothing
+        // there observes the argv. Accepting the same prompt and reading the
+        // call log is what pins the preview to the spawn.
+        let ran = plugin_calls_when_accepted(&repo, "codex", action, temp_home.path());
+        // `mock_calls` records argv without argv[0]; `expected` carries the
+        // binary name because that is how the preview renders it.
+        let want: Vec<String> = expected
+            .iter()
+            .map(|c| c.strip_prefix("codex ").unwrap().to_string())
+            .collect();
+        assert_eq!(ran, want, "{action} ran: {ran:#?}");
+    }
+}
+
+/// The `?` preview lists exactly the commands each Claude plugin subcommand
+/// runs: declining spawns none of them, and accepting spawns exactly those,
+/// so the confirmation the user answers matches what follows it.
+#[rstest]
+fn test_plugins_claude_prompt_previews_commands(mut repo: TestRepo) {
+    use crate::common::mock_commands::mock_calls;
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_plugins();
+
+    // Outside the repo: a call log in the working tree would leave an
+    // untracked file behind the command under test.
+    let call_log = TempDir::new().unwrap();
+
+    let temp_home = TempDir::new().unwrap();
+
+    for (action, expected) in [
+        (
+            "install",
+            [
+                "claude plugin marketplace add max-sixty/worktrunk",
+                "claude plugin install worktrunk@worktrunk",
+            ],
+        ),
+        (
+            "uninstall",
+            [
+                "claude plugin uninstall worktrunk@worktrunk",
+                "claude plugin marketplace remove worktrunk",
+            ],
+        ),
+    ] {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", action])
+            .current_dir(repo.root_path())
+            .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        let mut child = cmd.spawn().unwrap();
+        // `?` renders the preview; `n` then declines, so nothing runs.
+        child.stdin.take().unwrap().write_all(b"?\nn\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .ansi_strip()
+            .to_string();
+        // Compare the whole set of previewed commands, not each one in
+        // isolation: a command the preview lists but never runs is exactly
+        // what a per-command `contains` would let through.
+        // The first gutter line shares a line with the prompt, which `eprint!`
+        // leaves unterminated, so slice from each `claude ` rather than
+        // matching the line start.
+        let previewed: Vec<&str> = stderr
+            .lines()
+            .filter_map(|line| line.find("claude ").map(|i| line[i..].trim_end()))
+            .collect();
+        assert_eq!(previewed, expected, "{action} preview: {stderr}");
+        // The preview is only a preview: declining must run none of the
+        // commands it listed. `claude plugin list --json` is a read the
+        // subcommand makes to decide, not one of the commands it previews, so
+        // the log is filtered to the calls that change something.
+        let mutations = |calls: Vec<String>| -> Vec<String> {
+            calls
+                .into_iter()
+                .filter(|call| !call.ends_with("--json"))
+                .collect()
+        };
+        let calls = mutations(mock_calls(call_log.path(), "claude"));
+        assert!(
+            calls.is_empty(),
+            "declining {action} must run none of its commands: {calls:#?}"
+        );
+
+        // Both sides of the comparison above are the preview text, so nothing
+        // there observes the argv. Accepting the same prompt and reading the
+        // call log is what pins the preview to the spawn — and it is the only
+        // thing that can here: `setup_mock_claude_with_plugins` registers the
+        // `plugin marketplace` prefix, which matches `add` and `remove` alike,
+        // so a wrong marketplace name still reaches the mock's exit 0.
+        let ran = mutations(plugin_calls_when_accepted(
+            &repo,
+            "claude",
+            action,
+            temp_home.path(),
+        ));
+        // `mock_calls` records argv without argv[0]; `expected` carries the
+        // binary name because that is how the preview renders it.
+        let want: Vec<String> = expected
+            .iter()
+            .map(|c| c.strip_prefix("claude ").unwrap().to_string())
+            .collect();
+        assert_eq!(ran, want, "{action} ran: {ran:#?}");
+    }
+}
+
+/// `codex plugin remove` fails: the uninstall surfaces codex's error and stops
+/// rather than removing the marketplace out from under an installed plugin.
+#[rstest]
+fn test_plugins_codex_uninstall_plugin_remove_fails(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_plugin_ops_failing();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The marketplace removal's goal is that the marketplace is gone, so the
+/// harness reporting an empty list is that goal already met. Running
+/// `uninstall` a second time hits exactly this, and used to fail with nothing
+/// left to do.
+#[rstest]
+fn test_plugins_claude_uninstall_tolerates_absent_marketplace(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_marketplace_remove_failing(MockResponse::output("[]"));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The state a second `uninstall` lands in for a user with other
+/// marketplaces: the list is non-empty and worktrunk is simply not in it.
+#[rstest]
+fn test_plugins_claude_uninstall_tolerates_marketplace_missing_from_list(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_marketplace_remove_failing(MockResponse::output(
+        TestRepo::CLAUDE_MARKETPLACES_WITHOUT_WORKTRUNK,
+    ));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// An answer that cannot be read is not an absence. Each case is one way
+/// Claude Code could stop answering the question — the subcommand gone, output
+/// that is not JSON, and a list reshaped so it parses and still means
+/// something else — and each has to leave the removal's failure standing
+/// rather than report a marketplace it never removed.
+#[rstest]
+#[case::unsupported(MockResponse::exit(1).with_stderr("error: unknown option '--json'\n"))]
+#[case::unparsable(MockResponse::output("[{\"name\":"))]
+#[case::reshaped(MockResponse::output(r#"{"marketplaces":[{"name":"other"}]}"#))]
+fn test_plugins_claude_uninstall_surfaces_failure_when_list_unusable(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] list: MockResponse,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_with_marketplace_remove_failing(list);
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+
+    // The rendering is pinned by the single-case tests either side of this
+    // one; what each case here asserts is that an answer it could not read
+    // leaves claude's own error standing.
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.ansi_strip();
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("claude plugin marketplace remove worktrunk failed"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("marketplace removed"), "stderr:\n{stderr}");
+}
+
+/// The Codex counterpart: a second `uninstall` succeeds.
+#[rstest]
+fn test_plugins_codex_uninstall_tolerates_absent_marketplace(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_marketplace_remove_failing(MockResponse::output(
+        r#"{"marketplaces":[]}"#,
+    ));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The Codex counterpart: a marketplace Codex still lists after the removal
+/// failed is a genuine failure, and the error surfaces.
+#[rstest]
+fn test_plugins_codex_uninstall_surfaces_marketplace_remove_failure(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_marketplace_remove_failing(MockResponse::output(
+        TestRepo::CODEX_MARKETPLACES_WITH_WORKTRUNK,
+    ));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The Codex counterpart of the missing-from-list case. Codex deletes the
+/// whole `marketplaces` key with its last entry, so reading `config.toml`
+/// could not tell this state from a config whose key had moved; its own list
+/// reports the other marketplace and nothing else.
+#[rstest]
+fn test_plugins_codex_uninstall_tolerates_marketplace_missing_from_list(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_marketplace_remove_failing(MockResponse::output(
+        TestRepo::CODEX_MARKETPLACES_WITHOUT_WORKTRUNK,
+    ));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The Codex counterpart of the unusable-answer cases. The reshaped body is
+/// the other half of the shape check: entries Codex nests where it always has,
+/// naming worktrunk under a key that is no longer `name`.
+#[rstest]
+#[case::unsupported(MockResponse::exit(1).with_stderr("error: unexpected argument '--json'\n"))]
+#[case::unparsable(MockResponse::output("{\"marketplaces\":"))]
+#[case::reshaped(MockResponse::output(r#"{"marketplaces":[{"marketplace":"worktrunk"}]}"#))]
+fn test_plugins_codex_uninstall_surfaces_failure_when_list_unusable(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] list: MockResponse,
+) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_codex_with_marketplace_remove_failing(list);
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["config", "plugins", "codex", "uninstall", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.ansi_strip();
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("codex plugin marketplace remove worktrunk failed"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("marketplace removed"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn test_codex_plugin_metadata_is_valid_json() {
+    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let plugin: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project_root.join("plugins/worktrunk/.codex-plugin/plugin.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    // Codex discovers a marketplace's plugin list strictly from
+    // <repo-root>/.agents/plugins/marketplace.json (no fallback to the Claude
+    // .claude-plugin/marketplace.json). Each plugin's `source` must be an
+    // object pointing at a non-empty subdirectory — codex rejects a bare or
+    // root-relative source ("local plugin source path must not be empty"), so
+    // the plugin lives in plugins/worktrunk/ rather than at the repo root.
+    // Verified end-to-end against codex-cli 0.130.0: with this layout the
+    // worktrunk marketplace surfaces in /plugins and the plugin installs;
+    // without it the marketplace registers but enumerates zero plugins.
+    let marketplace: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project_root.join(".agents/plugins/marketplace.json")).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin["name"], "worktrunk");
+    // No `skills` key: Codex scans <plugin-root>/skills/ by convention when
+    // the manifest omits it, and an explicit "./skills/" names the same
+    // directory (verified against codex-cli 0.144.1). The scanned tree is the
+    // real-file mirror of repo-root skills/ — `codex plugin add` copies the
+    // plugin into its cache with a copier that drops symlink entries, which
+    // is why the mirror exists. See AGENTS.md → "Plugin skills are a
+    // generated mirror".
+    assert!(
+        plugin.get("skills").is_none(),
+        "the Codex manifest must not carry a `skills` key — Codex scans skills/ by convention"
+    );
+    // Metadata must not drift back toward the Claude plugin: the Codex plugin
+    // is scoped to configuration guidance (no activity-tracking claims), and
+    // its URLs are the canonical site (not the `/claude-code/` doc slug).
+    for key in ["description", "homepage"] {
+        let val = plugin[key].as_str().unwrap();
+        assert!(
+            !val.contains("activity") && !val.contains("claude-code"),
+            "plugin.json `{key}` regressed toward Claude/activity wording: {val}"
+        );
+    }
+    let iface = &plugin["interface"];
+    assert!(
+        !iface["longDescription"]
+            .as_str()
+            .unwrap()
+            .contains("activity"),
+        "plugin.json interface.longDescription must not claim activity tracking"
+    );
+    assert!(
+        !iface["websiteURL"]
+            .as_str()
+            .unwrap()
+            .contains("claude-code"),
+        "plugin.json interface.websiteURL must point at the canonical site"
+    );
+    // The Codex plugin ships activity-marker hooks *inline* in its manifest
+    // (`hooks` object, not a path). This is the functional definition of its
+    // Codex-native events, and it also overrides Codex's convention discovery
+    // (an absent `hooks` key makes Codex auto-discover a `hooks/hooks.json` at
+    // the plugin root). The Claude hooks file sits at that same conventional
+    // `hooks/hooks.json` (Claude's loader discovers it there — #3417), but the
+    // inline Codex override means Codex never loads it, so the #3362 collision
+    // (Codex surfacing the *Claude* file's events) stays closed. `Stop`
+    // returns 🤖 to 💬 at turn end, and `SessionEnd` clears the marker when
+    // the main thread ends. See AGENTS.md → "Plugin Layout".
+    let codex_hooks = plugin
+        .get("hooks")
+        .and_then(|h| h.get("hooks"))
+        .expect("Codex manifest must carry an inline `hooks` object");
+    // Exactly the Codex-native events — no Claude-only `Notification`,
+    // `WorktreeCreate`, or `WorktreeRemove`.
+    let mut events = codex_hooks
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    assert_eq!(
+        events,
+        [
+            "PermissionRequest",
+            "SessionEnd",
+            "Stop",
+            "UserPromptSubmit"
+        ]
+    );
+    let session_end = &codex_hooks["SessionEnd"][0]["hooks"][0];
+    assert_eq!(
+        session_end["command"],
+        r#"bash "$PLUGIN_ROOT/hooks/wt.sh" config state marker clear || true"#
+    );
+    assert_eq!(session_end["timeout"], 3);
+    // Commands use Codex's native `$PLUGIN_ROOT`, never the Claude-branded
+    // `$CLAUDE_PLUGIN_ROOT` compat alias — nothing Claude-branded in a Codex
+    // session (#3362).
+    let hooks_json = serde_json::to_string(codex_hooks).unwrap();
+    assert!(
+        hooks_json.contains("$PLUGIN_ROOT/hooks/wt.sh"),
+        "Codex hook commands must call the shim via $PLUGIN_ROOT"
+    );
+    assert!(
+        !hooks_json.contains("CLAUDE_PLUGIN_ROOT"),
+        "Codex hooks must not reference the Claude-branded $CLAUDE_PLUGIN_ROOT alias"
+    );
+    // Hooks are inline, so the wrapper dir still holds only plugin.json — no
+    // separate hooks file, and the inline override keeps Codex off the shared
+    // Claude `hooks/hooks.json`.
+    assert!(
+        !project_root
+            .join("plugins/worktrunk/.codex-plugin/hooks")
+            .exists(),
+        "the Codex wrapper dir must hold only plugin.json"
+    );
+    assert_eq!(marketplace["plugins"][0]["name"], "worktrunk");
+    // Source is a non-empty subdir object; a bare "./" is rejected by codex.
+    assert_eq!(marketplace["plugins"][0]["source"]["source"], "local");
+    assert_eq!(
+        marketplace["plugins"][0]["source"]["path"],
+        "./plugins/worktrunk"
+    );
+    assert_eq!(
+        marketplace["plugins"][0]["policy"]["installation"],
+        "AVAILABLE"
+    );
+    // Codex validates `interface` is an object and requires `displayName`;
+    // omitting it is what made the plugin undiscoverable in /plugins.
+    assert_eq!(marketplace["interface"]["displayName"], "Worktrunk");
+}
+
+/// Claude Code + Codex share `plugins/worktrunk/`; Gemini's manifest is a
+/// third loader-mandated repo-root pointer (`gemini-extension.json` +
+/// `hooks/hooks.json` — Gemini hard-probes `${extensionPath}/{hooks,skills}/`
+/// at the extension root with no path indirection). Verified end-to-end
+/// against the real CLIs: Claude (claude-cli 2.1.207) reads the manifest at
+/// `<plugin-root>/.claude-plugin/plugin.json` — the only location `claude
+/// plugin validate` accepts — and discovers components by convention: hooks
+/// at `hooks/hooks.json`, skills by scanning `skills/*/SKILL.md`. A
+/// marketplace install of exactly this shape loads the skills and fires the
+/// hooks with no component keys in the manifest. Codex (codex-cli 0.144.1)
+/// also scans `skills/` by convention when the manifest omits the key, but
+/// its installer's cache copy drops symlink entries — which is why the
+/// plugin's `skills/` is a real-file mirror of the repo-root `skills/`,
+/// generated by `test_docs_are_in_sync` (see plugins/worktrunk/AGENTS.md
+/// → "Plugin skills are a generated mirror"). Gemini
+/// (gemini-cli 0.42) resolves the extension at the repo root, so
+/// `${extensionPath}/skills/` is the real single-sourced repo-root `skills/`
+/// and its hooks call the canonical
+/// `${extensionPath}/plugins/worktrunk/hooks/wt.sh` — no symlink, no bundled
+/// copy, and `gemini extensions install owner/repo` works natively.
+///
+/// Duplicated strings can't be `include!`d into JSON, so this test is the
+/// drift guard: the Claude marketplace/manifest descriptions stay
+/// byte-identical, every product description shares the canonical opening
+/// sentence, and the Claude manifest carries no component-path keys
+/// (conventions are the single loading mechanism).
+#[test]
+fn test_plugin_layout_is_consolidated() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |p: &str| fs::read_to_string(root.join(p)).unwrap();
+    let json = |p: &str| serde_json::from_str::<serde_json::Value>(&read(p)).unwrap();
+
+    // Repo-local maintainer skills are authored once for Claude and exposed to
+    // Codex through its conventional .agents/skills discovery path. Windows
+    // checkouts with core.symlinks=false materialize the link as a plain file;
+    // that accepted limitation is documented in plugins/worktrunk/AGENTS.md.
+    #[cfg(unix)]
+    {
+        let codex_skills = root.join(".agents/skills");
+        assert_eq!(
+            fs::read_link(&codex_skills).unwrap(),
+            std::path::Path::new("../.claude/skills"),
+            ".agents/skills must point at the authored Claude maintainer skills"
+        );
+        assert!(
+            codex_skills.join("running-tend/SKILL.md").is_file(),
+            ".agents/skills must resolve to the repo-local maintainer skills"
+        );
+    }
+
+    // Repo root keeps ONLY the two loader-mandated marketplace pointers.
+    assert!(
+        !root.join(".claude-plugin/plugin.json").exists()
+            && !root.join(".claude-plugin/hooks").exists(),
+        ".claude-plugin/ at the repo root must hold only marketplace.json"
+    );
+    let claude_mkt = json(".claude-plugin/marketplace.json");
+    assert_eq!(claude_mkt["plugins"][0]["source"], "./plugins/worktrunk");
+
+    // Claude manifest in the plugin's own `.claude-plugin/` wrapper — the
+    // only manifest location `claude plugin validate` accepts (a bare
+    // plugin.json at the plugin root loads through an undocumented runtime
+    // fallback but fails validation).
+    let claude = json("plugins/worktrunk/.claude-plugin/plugin.json");
+    assert!(
+        !root.join("plugins/worktrunk/plugin.json").exists(),
+        "the Claude manifest lives at .claude-plugin/plugin.json; a root-level \
+         plugin.json rides an undocumented fallback and fails `claude plugin validate`"
+    );
+    // The manifest carries metadata only; hooks and skills load by convention.
+    // The override keys are worse than redundant: the string-path `hooks`
+    // override is not honored for plugin loads (#3417), so a `hooks` key can
+    // only mask a mislocated file, and a `skills` array re-adds directories
+    // the default `skills/` scan already picks up.
+    assert!(
+        claude.get("hooks").is_none() && claude.get("skills").is_none(),
+        "the Claude manifest must not carry `hooks`/`skills` keys — components \
+         load by convention (hooks/hooks.json; skills/*/SKILL.md)"
+    );
+    assert!(
+        root.join("plugins/worktrunk/hooks/hooks.json").exists()
+            && root.join("plugins/worktrunk/hooks/wt.sh").exists(),
+        "Claude hooks must live at the plugin root's hooks/"
+    );
+    // The Claude hooks file must sit at the conventional hooks/hooks.json.
+    // Claude Code discovers plugin hooks by that convention path and does NOT
+    // honor plugin.json's string-path `hooks` override for plugin loads, so a
+    // Claude-scoped name (hooks/claude-hooks.json) silently stops the hooks
+    // from loading — /hooks shows nothing and the 🤖/💬 markers never update
+    // (#3417). Sitting at the conventional path does NOT resurface the #3362
+    // Codex collision: the Codex manifest defines its hooks inline (verified
+    // above), taking Codex's Some(Inline) branch, which overrides convention
+    // discovery — so Codex never loads this file even though it is now at the
+    // discoverable path. Structural scoping via the filename is what broke
+    // Claude; the inline Codex manifest is what actually keeps Codex clean.
+    assert!(
+        !root
+            .join("plugins/worktrunk/hooks/claude-hooks.json")
+            .exists(),
+        "the Claude hooks file must sit at the conventional hooks/hooks.json that Claude \
+         Code's loader discovers, not a Claude-scoped name the string-path override can't rescue (#3417)"
+    );
+    assert!(
+        !read("plugins/worktrunk/hooks/hooks.json").contains(".claude-plugin/hooks/"),
+        "hooks.json must reference $CLAUDE_PLUGIN_ROOT/hooks/wt.sh, not the old wrapper path"
+    );
+
+    // The description is duplicated across the Claude marketplace pointer and
+    // the Claude manifest — they must stay byte-identical.
+    assert_eq!(
+        claude_mkt["plugins"][0]["description"], claude["description"],
+        ".claude-plugin/marketplace.json and plugins/worktrunk/.claude-plugin/plugin.json \
+         descriptions drifted"
+    );
+
+    // Gemini extension: manifest + hooks are loader-mandated repo-root
+    // pointers (Gemini hard-probes ${extensionPath}/{hooks,skills}/ at the
+    // extension root). Relocating to the root — instead of a plugins/gemini/
+    // sibling — is what makes `gemini extensions install owner/repo` work and
+    // lets the extension reuse the real repo-root skills/ + the canonical
+    // worktrunk shim instead of a symlink and a bundled copy.
+    assert!(
+        !root.join("plugins/gemini").exists(),
+        "Gemini extension was relocated to the repo root; plugins/gemini/ must not exist"
+    );
+    let gemini = json("gemini-extension.json");
+    assert_eq!(gemini["name"], "worktrunk");
+    assert!(
+        gemini["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "gemini-extension.json needs a description (shown in `gemini extensions list`)"
+    );
+    // Gemini reuses the single-sourced repo-root skills/ (a real dir that
+    // survives `gemini extensions install`'s copy) — not a symlink or bundle.
+    assert!(
+        root.join("skills").is_dir() && !root.join("skills").is_symlink(),
+        "repo-root skills/ must be a real directory Gemini resolves via ${{extensionPath}}/skills"
+    );
+    // Gemini hooks call the canonical worktrunk shim by its real path — no
+    // bundled ${extensionPath}/hooks/wt.sh, no cross-dir `../`, no old wrapper.
+    let gemini_hooks = read("hooks/hooks.json");
+    assert!(
+        gemini_hooks.contains("${extensionPath}/plugins/worktrunk/hooks/wt.sh")
+            && !gemini_hooks.contains("${extensionPath}/hooks/wt.sh")
+            && !gemini_hooks.contains("../")
+            && !gemini_hooks.contains(".claude-plugin/"),
+        "Gemini hooks must call the canonical ${{extensionPath}}/plugins/worktrunk/hooks/wt.sh"
+    );
+    assert!(
+        !root.join("hooks/wt.sh").exists(),
+        "no bundled Gemini wt.sh — hooks reference the canonical worktrunk shim"
+    );
+
+    // Claude and Codex auto-discover skills by scanning the plugin root's
+    // skills/ for <dir>/SKILL.md. That tree is a real-file mirror of the
+    // authored repo-root skills/, generated by test_docs_are_in_sync
+    // (sync_plugin_skills_mirror): Codex's plugin installer copies the plugin
+    // root with a copier that silently skips symlink entries, so a symlink
+    // anywhere in the tree — the old top-level `skills -> ../../skills` or a
+    // nested reference link — ships no content to Codex installs, and a
+    // symlink also materializes as a plain text file on Windows checkouts.
+    // Claude's installer dereferences symlinks, so real files serve it
+    // equally. The invariant here is structural: regular files all the way
+    // down.
+    let plugin_skills = root.join("plugins/worktrunk/skills");
+    assert!(
+        plugin_skills.is_dir() && !plugin_skills.is_symlink(),
+        "plugins/worktrunk/skills must be a real directory (mirror of repo-root skills/); \
+         Codex's installer drops symlinks"
+    );
+    let mut dirs = vec![plugin_skills];
+    let mut mirrored = 0usize;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            mirrored += 1;
+            assert!(
+                !entry.path().is_symlink(),
+                "{} is a symlink — the plugin skills mirror must hold only regular files \
+                 (Codex's installer silently drops symlinks)",
+                entry.path().display()
+            );
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    // The assertion above is absence, so an empty mirror satisfies it over
+    // nothing — see "Guards that scan source text" in `tests/AGENTS.md`.
+    assert!(
+        mirrored > 0,
+        "plugins/worktrunk/skills is empty — the mirror never generated, so the \
+         symlink invariant above just passed over nothing"
+    );
+
+    // Every repo-root skill dir carries a SKILL.md, since the convention scan
+    // silently ignores a directory without one.
+    let mut skill_dirs = 0usize;
+    for entry in fs::read_dir(root.join("skills")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            skill_dirs += 1;
+            assert!(
+                entry.path().join("SKILL.md").exists(),
+                "skills/{} has no SKILL.md — Claude's convention scan silently ignores it",
+                entry.file_name().to_string_lossy()
+            );
+        }
+    }
+    assert!(skill_dirs > 0, "skills/ holds no skill directories");
+
+    let hooks_json = json("plugins/worktrunk/hooks/hooks.json");
+    let commands: Vec<(&str, &str)> = hooks_json["hooks"]
+        .as_object()
+        .expect("hooks.json must have a `hooks` object")
+        .iter()
+        .flat_map(|(event, groups)| {
+            groups
+                .as_array()
+                .expect("each hook event must be an array")
+                .iter()
+                .flat_map(|group| {
+                    group["hooks"]
+                        .as_array()
+                        .expect("each hook group must have a `hooks` array")
+                })
+                .map(move |hook| {
+                    (
+                        event.as_str(),
+                        hook["command"]
+                            .as_str()
+                            .expect("each hook must define a command"),
+                    )
+                })
+        })
+        .collect();
+
+    // Every hook runs the same literal command: `wt config plugins claude
+    // hook` reads Claude Code's payload and dispatches on the event, so the
+    // behavior lives in `wt` and is tested in `claude_hook.rs`. Anthropic's
+    // plugin directory refuses a hook command whose path the shell computes or
+    // that carries an inline program. The root stays unbraced: Claude hands
+    // each command to the user's login shell before `bash` launches, and fish
+    // rejects `${CLAUDE_PLUGIN_ROOT}` ("Variables cannot be bracketed"). The
+    // marker events end in `|| true`: a `wt` too old to have `hook` exits 2,
+    // which Claude Code reads as blocking the prompt, tool call, permission,
+    // or stop. The worktree events must fail when `wt` does.
+    const HOOK: &str = r#"bash "$CLAUDE_PLUGIN_ROOT/hooks/wt.sh" config plugins claude hook"#;
+    let mut events: Vec<&str> = commands.iter().map(|(event, _)| *event).collect();
+    events.sort_unstable();
+    assert_eq!(
+        events,
+        [
+            "Notification",
+            "PermissionRequest",
+            "PreToolUse",
+            "SessionEnd",
+            "Stop",
+            "UserPromptSubmit",
+            "WorktreeCreate",
+            "WorktreeRemove",
+        ]
+    );
+    for (event, command) in &commands {
+        let expected = if event.starts_with("Worktree") {
+            HOOK.to_string()
+        } else {
+            format!("{HOOK} || true")
+        };
+        assert_eq!(*command, expected, "{event} hook command drifted");
+    }
+    // The product description must not drift across tools. Byte-identical is
+    // schema-impossible (Codex omits the activity clause, Gemini says
+    // "extension"), but every manifest shares the canonical opening sentence.
+    const STEM: &str =
+        "Worktrunk is a CLI for Git worktree management, designed for parallel AI agent workflows.";
+    let codex = json("plugins/worktrunk/.codex-plugin/plugin.json");
+    for (label, val) in [
+        (
+            "plugins/worktrunk/.claude-plugin/plugin.json",
+            &claude["description"],
+        ),
+        (
+            ".claude-plugin/marketplace.json",
+            &claude_mkt["plugins"][0]["description"],
+        ),
+        (
+            "plugins/worktrunk/.codex-plugin/plugin.json",
+            &codex["description"],
+        ),
+        ("gemini-extension.json", &gemini["description"]),
+    ] {
+        let val = val.as_str().unwrap();
+        assert!(
+            val.starts_with(STEM),
+            "{label} description must start with the canonical product sentence; got: {val}"
+        );
+    }
+}
+
+/// Keep Windows-specific Codex commands present and shell-neutral on every platform.
+/// The invocation rationale lives in plugins/worktrunk/hooks/wt.cmd; the Windows
+/// shell-integration test below exercises the commands themselves.
+#[test]
+fn test_codex_hooks_carry_windows_commands() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let codex: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("plugins/worktrunk/.codex-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+
+    let hooks: Vec<&serde_json::Value> = codex["hooks"]["hooks"]
+        .as_object()
+        .expect("the Codex manifest must define hooks inline (#3362)")
+        .values()
+        .flat_map(|event| event.as_array().expect("each hook event must be an array"))
+        .flat_map(|group| {
+            group["hooks"]
+                .as_array()
+                .expect("each hook group must have a `hooks` array")
+        })
+        .collect();
+    assert_eq!(
+        hooks.len(),
+        4,
+        "expected all 4 Codex hooks (UserPromptSubmit, PermissionRequest, Stop, \
+         SessionEnd); a newly added one must be pinned too"
+    );
+
+    for hook in hooks {
+        let command = hook["command"]
+            .as_str()
+            .expect("each Codex hook must define a command");
+        let windows = hook["commandWindows"].as_str().unwrap_or_else(|| {
+            panic!("Codex hook must define commandWindows; command:\n{command}")
+        });
+        assert!(
+            !windows.split_whitespace().any(|word| word == "bash"),
+            "commandWindows must use the Git Bash shim, not bare bash:\n{windows}"
+        );
+        assert!(
+            !windows
+                .split_whitespace()
+                .any(|word| word == "wt" || word == "wt.exe" || word.ends_with("\\wt.exe")),
+            "commandWindows must not invoke Windows Terminal as wt:\n{windows}"
+        );
+        assert!(
+            windows.starts_with(r#"cmd /d /c call "${PLUGIN_ROOT}\hooks\wt.cmd" "#)
+                && root.join("plugins/worktrunk/hooks/wt.cmd").is_file(),
+            "commandWindows must invoke the shipped shim through cmd /d /c call:\n{windows}"
+        );
+        assert!(
+            !windows.contains("||") && !windows.contains('&') && !windows.contains("exit /b"),
+            "commandWindows must leave cmd-only failure handling in the shim:\n{windows}"
+        );
+        assert!(
+            windows.contains("${PLUGIN_ROOT}") && !windows.contains("$PLUGIN_ROOT/"),
+            "commandWindows must use Codex's textual ${{PLUGIN_ROOT}} substitution:\n{windows}"
+        );
+        // The Unix side keeps the unbraced form the login shell expands.
+        assert!(
+            command.contains("$PLUGIN_ROOT") && !command.contains("${PLUGIN_ROOT}"),
+            "the Unix `command` must keep the unbraced $PLUGIN_ROOT. command:\n{command}"
+        );
+    }
+}
+
+/// The directory PATH names `git.exe` in — `Git\cmd` for a default Git for
+/// Windows install, which is the only directory of that install the installer
+/// puts on PATH. The Windows tests below pin a PATH built from it: narrow
+/// enough that no ambient `wt.exe` can stand in for the worktrunk under test,
+/// while still holding what a real user's PATH holds, so the shim has to derive
+/// Git Bash the way it will on their machine.
+#[cfg(windows)]
+fn git_dir_on_path() -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").expect("a Windows test runner must set PATH");
+    std::env::split_paths(&path)
+        .find(|dir| dir.join("git.exe").is_file())
+        .expect("a Windows test runner must have git.exe on PATH")
+}
+
+/// `extra` first, then Git and System32 — the latter so that a bare command
+/// name a test spells itself still resolves. The shim's own `where` is spelled
+/// absolutely, so it no longer depends on this.
+#[cfg(windows)]
+fn pinned_windows_path(extra: &[std::path::PathBuf]) -> std::ffi::OsString {
+    let system32 = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+    )
+    .join("System32");
+    let dirs: Vec<std::path::PathBuf> = extra
+        .iter()
+        .cloned()
+        .chain([git_dir_on_path(), system32])
+        .collect();
+    std::env::join_paths(dirs).unwrap()
+}
+
+/// `C:\a\b` as Git Bash sees it, `/c/a/b`. Only for handing a path to something
+/// that will run *inside* bash: `command -v` takes an argument with no `/` as a
+/// command name and searches PATH for it, so a Windows-spelled path there is
+/// never found, and a test that spelled it that way would pass for that reason
+/// rather than the one it means to pin.
+#[cfg(windows)]
+fn msys_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    let (drive, rest) = text.split_at(2);
+    assert!(
+        drive.ends_with(':'),
+        "expected a drive-qualified path, got {text}"
+    );
+    format!(
+        "/{}{}",
+        drive[..1].to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    )
+}
+
+/// Run the shipped hooks through Codex's cmd /C and PowerShell -Command shapes.
+/// Check marker updates, Unicode arguments, and best-effort failures from a plugin
+/// path containing spaces. PowerShell 7 is required by shell-integration-tests.
+#[cfg(all(windows, feature = "shell-integration-tests"))]
+#[rstest]
+fn test_codex_windows_hook_commands_set_the_marker(repo: TestRepo) {
+    use std::os::windows::process::CommandExt;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let codex: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("plugins/worktrunk/.codex-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+
+    // The shipped shim pair, under a plugin root with a space in it.
+    let plugin_root = repo.root_path().join("plug in");
+    fs::create_dir_all(plugin_root.join("hooks")).unwrap();
+    for name in ["wt.cmd", "wt.sh"] {
+        fs::copy(
+            root.join("plugins/worktrunk/hooks").join(name),
+            plugin_root.join("hooks").join(name),
+        )
+        .unwrap();
+    }
+
+    let command_for = |event: &str| -> String {
+        codex["hooks"]["hooks"][event][0]["hooks"][0]["commandWindows"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{event} must define a commandWindows"))
+            .replace("${PLUGIN_ROOT}", &plugin_root.display().to_string())
+    };
+
+    // The worktrunk wt.sh is meant to find, under the name it prefers.
+    let path_dir = repo.root_path().join("path-dir");
+    fs::create_dir_all(&path_dir).unwrap();
+    fs::copy(crate::common::wt_bin(), path_dir.join("git-wt.exe")).unwrap();
+    let with_worktrunk = pinned_windows_path(&[path_dir]);
+    let without_worktrunk = pinned_windows_path(&[]);
+
+    let run_hook =
+        |shell: &std::path::Path, event: &str, path: &std::ffi::OsString| -> std::process::Output {
+            let line = command_for(event);
+            let mut cmd = std::process::Command::new(shell);
+            repo.configure_wt_cmd(&mut cmd);
+            if shell.file_name() == Some(std::ffi::OsStr::new("cmd.exe")) {
+                cmd.arg("/C").raw_arg(format!("\"{line}\""));
+            } else {
+                cmd.args(["-NoProfile", "-Command"]).arg(line);
+            }
+            cmd.env("PATH", path)
+                .env_remove("WORKTRUNK_BIN")
+                .current_dir(repo.root_path())
+                .output()
+                .unwrap()
+        };
+    let describe = |shell: &std::path::Path, output: &std::process::Output| {
+        format!(
+            "under {}, got {}\nstdout:\n{}\nstderr:\n{}",
+            shell.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let marker_key = format!("worktrunk.state.{}.marker", repo.current_branch());
+    let marker = || -> String {
+        let output = repo
+            .git_command()
+            .args(["config", "--get", &marker_key])
+            .run();
+        output.map_or_else(
+            |_| String::new(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )
+    };
+
+    for shell in [
+        which::which("cmd.exe").expect("cmd.exe must be installed"),
+        which::which("powershell.exe").expect("Windows PowerShell must be installed"),
+        which::which("pwsh.exe").expect("shell-integration-tests requires PowerShell 7 on PATH"),
+    ] {
+        let shell = shell.as_path();
+
+        let output = run_hook(shell, "UserPromptSubmit", &with_worktrunk);
+        assert!(
+            output.status.success(),
+            "UserPromptSubmit hook must succeed; {}",
+            describe(shell, &output)
+        );
+        assert!(
+            marker().contains('🤖'),
+            "UserPromptSubmit must store the working marker, not a mangled byte sequence; \
+             got {:?} {}",
+            marker(),
+            describe(shell, &output)
+        );
+
+        let output = run_hook(shell, "Stop", &with_worktrunk);
+        assert!(
+            output.status.success(),
+            "Stop hook must succeed; {}",
+            describe(shell, &output)
+        );
+        assert!(
+            marker().contains('💬'),
+            "Stop must replace the marker with the waiting one; got {:?} {}",
+            marker(),
+            describe(shell, &output)
+        );
+
+        let output = run_hook(shell, "SessionEnd", &with_worktrunk);
+        assert!(
+            output.status.success(),
+            "SessionEnd hook must succeed; {}",
+            describe(shell, &output)
+        );
+        assert!(
+            marker().is_empty(),
+            "SessionEnd must clear the marker; got {:?} {}",
+            marker(),
+            describe(shell, &output)
+        );
+
+        // Worktrunk not installed: the marker is optional decoration, so the
+        // hook must stay silent rather than fail every prompt (#4007).
+        let output = run_hook(shell, "UserPromptSubmit", &without_worktrunk);
+        assert!(
+            output.status.success(),
+            "a hook that cannot find worktrunk must still exit 0 — a nonzero exit is what \
+             raises Codex's repeated \"Hook failed\" banner; {}",
+            describe(shell, &output)
+        );
+        assert!(
+            marker().is_empty(),
+            "a failed hook must not invent a marker; got {:?} {}",
+            marker(),
+            describe(shell, &output)
+        );
+    }
+}
+
+/// `wt.sh` assigns `WT` in each of its branches, but on Windows every branch can
+/// be skipped: with neither `git-wt.exe` nor `wt` on PATH it falls out of the
+/// `elif` with `WT` untouched. A hook is handed the caller's whole environment
+/// (`command.env_clear(); command.envs(environment)` in
+/// `codex-rs/hooks/src/engine/command_runner.rs` hands Codex's session snapshot
+/// to each one), so a user's own `WT` arrives already set — and the final
+/// `command -v "$WT"` check then accepts it and runs it, in place of the
+/// worktrunk the script exists to resolve. Windows Terminal is spelled `wt`,
+/// which is exactly the binary the branch above rejects by name.
+///
+/// The shim exits 0 either way — that is its hook contract (#4239) — so what
+/// separates "declined the inherited `WT`" from "ran it" is the output: no
+/// version line, and the resolution failure named on stderr.
+#[cfg(windows)]
+#[rstest]
+fn test_wt_sh_ignores_an_inherited_wt(repo: TestRepo) {
+    use std::os::windows::process::CommandExt;
+
+    let shim =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/worktrunk/hooks/wt.cmd");
+
+    // A PATH with Git on it (so the shim finds bash) and no worktrunk under
+    // either name — the case that leaves `WT` unassigned. The inherited value
+    // names a *real* worktrunk, spelled the way bash can run it, so honoring it
+    // would look exactly like success.
+    let mut cmd = std::process::Command::new("cmd.exe");
+    repo.configure_wt_cmd(&mut cmd);
+    let output = cmd
+        .arg("/C")
+        .raw_arg(format!("\"\"{}\" --version\"", shim.display()))
+        .env("PATH", pinned_windows_path(&[]))
+        .env("WT", msys_path(&crate::common::wt_bin()))
+        .env_remove("WORKTRUNK_BIN")
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("wt ") && stderr.contains("could not find 'wt' in PATH"),
+        "wt.sh must clear WT and resolve worktrunk itself, not run an inherited one; \
+         got {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+/// Never execute a project's git.exe when finding the PATH installation.
+#[cfg(windows)]
+#[rstest]
+fn test_shim_ignores_a_git_in_the_current_directory(repo: TestRepo) {
+    use crate::common::mock_commands::{MockConfig, mock_calls};
+    use std::os::windows::process::CommandExt;
+
+    let shim =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/worktrunk/hooks/wt.cmd");
+
+    // The only worktrunk the shim is allowed to find: a real one, in a
+    // directory on the PATH this test pins.
+    let path_dir = repo.root_path().join("path-dir");
+    fs::create_dir_all(&path_dir).unwrap();
+    fs::copy(crate::common::wt_bin(), path_dir.join("git-wt.exe")).unwrap();
+
+    let project = repo.root_path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    MockConfig::new("git")
+        .command("--exec-path", MockResponse::output("not-an-install"))
+        .write(&project);
+    let call_log = TempDir::new().unwrap();
+
+    let mut cmd = std::process::Command::new("cmd.exe");
+    repo.configure_wt_cmd(&mut cmd);
+    let output = cmd
+        .arg("/C")
+        .raw_arg(format!("\"\"{}\" --version\"", shim.display()))
+        .env("PATH", pinned_windows_path(&[path_dir]))
+        .env("WORKTRUNK_TEST_MOCK_CONFIG_DIR", &project)
+        .env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path())
+        .env_remove("WORKTRUNK_BIN")
+        .current_dir(&project)
+        .output()
+        .unwrap();
+
+    // The version line is `wt <version>`, where the version is whatever the
+    // build embedded — the semver from a tagged checkout, a bare commit hash
+    // from CI's — so the prefix is the part worth pinning.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.trim_start().starts_with("wt "),
+        "the shim must find git through PATH, not through the current directory; \
+         got {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(mock_calls(call_log.path(), "git").is_empty());
+}
+
+/// The hook must use Git's installed runtime, even if GIT_EXEC_PATH names a
+/// different helper directory. Run through cmd's real for/f quoting.
+#[cfg(windows)]
+#[rstest]
+fn test_shim_derives_bash_from_the_git_on_path(repo: TestRepo) {
+    use std::os::windows::process::CommandExt;
+
+    let shim =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/worktrunk/hooks/wt.cmd");
+
+    // The only worktrunk the shim is allowed to find: a real one, in a
+    // directory on the PATH this test pins.
+    let path_dir = repo.root_path().join("path-dir");
+    fs::create_dir_all(&path_dir).unwrap();
+    fs::copy(crate::common::wt_bin(), path_dir.join("git-wt.exe")).unwrap();
+
+    let helper_override = repo.root_path().join("other-helpers");
+    fs::create_dir_all(&helper_override).unwrap();
+
+    let mut cmd = std::process::Command::new("cmd.exe");
+    repo.configure_wt_cmd(&mut cmd);
+    let output = cmd
+        .arg("/C")
+        .raw_arg(format!("\"\"{}\" --version\"", shim.display()))
+        .env("PATH", pinned_windows_path(&[path_dir]))
+        .env("GIT_EXEC_PATH", &helper_override)
+        .env_remove("WORKTRUNK_BIN")
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.trim_start().starts_with("wt "),
+        "the shim must query the installed Git runtime, ignoring GIT_EXEC_PATH; \
+         got {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Claude hands each hook `command` to the user's LOGIN shell, which parses the
+/// whole line before the leading `bash …` ever launches. The command must
+/// therefore parse cleanly under fish, zsh, and bash — fish in particular
+/// rejects bash brace syntax (`${VAR}` → "Variables cannot be bracketed"). This
+/// syntax-checks every Claude hook command under all three shells with their
+/// no-execute flags, so a reintroduced brace (or any other non-portable
+/// construct) fails here instead of silently breaking fish users at runtime.
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+#[test]
+fn test_claude_hook_commands_parse_in_all_shells() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hooks_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("plugins/worktrunk/hooks/hooks.json")).unwrap(),
+    )
+    .unwrap();
+
+    let commands: Vec<&str> = hooks_json["hooks"]
+        .as_object()
+        .expect("hooks.json must have a `hooks` object")
+        .values()
+        .flat_map(|event| event.as_array().expect("each hook event must be an array"))
+        .flat_map(|group| {
+            group["hooks"]
+                .as_array()
+                .expect("each hook group must have a `hooks` array")
+        })
+        .map(|hook| {
+            hook["command"]
+                .as_str()
+                .expect("each hook must define a command")
+        })
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "expected at least one hook command to syntax-check"
+    );
+
+    // Each shell's no-execute flag: parse and report syntax errors without
+    // running the command. fish/zsh/bash all spell this `-n`.
+    for command in &commands {
+        for shell in ["fish", "bash", "zsh"] {
+            let output = std::process::Command::new(shell)
+                .args(["-n", "-c", command])
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {shell}: {e}"));
+            assert!(
+                output.status.success(),
+                "{shell} failed to parse hook command:\n  {command}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Claude Code fires `WorktreeRemove` with the path it recorded at creation, and
+/// that path can outlive the worktree in more than one way. #3493 covered the
+/// recorded path being gone. The third state is a path that *exists* but holds
+/// no worktree — a skeleton directory left by an interrupted create or remove:
+/// no `.git`, invisible to both `git worktree list` and `wt list`, and never
+/// cleaned up by prune. An existence guard let it through to `wt remove <path>`,
+/// which resolves a path naming no worktree as a branch name and exits 1 (`No
+/// branch named …` in-tree, `fatal: not a git repository` outside the repo).
+/// Claude Code reads that as a failed removal and keeps the session row, so the
+/// finished background session can never be deleted with Ctrl+X (#3753).
+///
+/// The guard therefore tests for git's marker rather than for the directory:
+/// every linked worktree carries a `.git` file, and a dirty / locked / unmerged
+/// one still does, so genuine failures keep surfacing loudly (#2939). All three
+/// directions are pinned below — a skeleton is a no-op, a clean worktree is
+/// still removed, a dirty one still fails — so neither a blanket `exit 0` nor a
+/// swallowed `wt remove` failure can satisfy this test. It runs the real command
+/// out of `hooks.json`.
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+#[rstest]
+fn test_worktree_remove_hook_skips_path_holding_no_worktree(mut repo: TestRepo) {
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Output, Stdio};
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hooks_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("plugins/worktrunk/hooks/hooks.json")).unwrap(),
+    )
+    .unwrap();
+    let command = hooks_json["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("WorktreeRemove hook must define a command")
+        .to_owned();
+
+    // Branched from `main` at HEAD, so its removal is the unremarkable case:
+    // clean worktree, merged branch, both go. Created before `run_hook` below
+    // takes its shared borrow of `repo`.
+    let live = repo.add_worktree("hook-live");
+
+    // Fire the hook exactly as Claude Code does: the recorded path on stdin, the
+    // plugin root in the environment. No `CLAUDE_PROJECT_DIR` — the hook
+    // resolves the repository from the worktree path and must never consult a
+    // project dir (#3754), so setting one here would be dead setup.
+    let run_hook = |worktree_path: &Path| -> Output {
+        let mut cmd = std::process::Command::new("bash");
+        repo.configure_wt_cmd(&mut cmd);
+        let mut child = cmd
+            .args(["-c", &command])
+            .env("WORKTRUNK_BIN", crate::common::wt_bin())
+            .env("CLAUDE_PLUGIN_ROOT", root.join("plugins/worktrunk"))
+            .current_dir(repo.root_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn bash");
+        let payload = serde_json::json!({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": worktree_path.to_str().unwrap(),
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let describe = |output: &Output| {
+        format!(
+            "got {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // A skeleton directory: exists, holds no worktree, has no `.git`. Both
+    // shapes the issue reports — nested inside the repository, where git
+    // discovery walks up and answers for the *parent* (which is why
+    // `rev-parse --is-inside-work-tree` is not a usable test), and outside it,
+    // where git has nothing to walk up to.
+    for skeleton in [
+        repo.root_path().join(".claude/worktrees/ghost"),
+        repo.home_path().join("outside/ghost"),
+    ] {
+        fs::create_dir_all(skeleton.join("apps")).unwrap();
+        let output = run_hook(&skeleton);
+        assert!(
+            output.status.success(),
+            "hook must be a no-op for a path holding no worktree ({}); {}",
+            skeleton.display(),
+            describe(&output)
+        );
+        assert!(
+            skeleton.exists(),
+            "hook must leave a directory it doesn't own in place: {}",
+            skeleton.display()
+        );
+    }
+
+    // Leniency is scoped to "no worktree lives here", so a dirty worktree —
+    // which has a `.git` like any other — must still fail loudly rather than be
+    // swallowed alongside the skeletons.
+    assert!(live.join(".git").exists(), "a linked worktree has a .git");
+    fs::write(live.join("file.txt"), "uncommitted\n").unwrap();
+    let output = run_hook(&live);
+    assert!(
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("uncommitted changes"),
+        "hook must still refuse a dirty worktree, and for that reason; {}",
+        describe(&output)
+    );
+    assert!(live.exists(), "a refused removal must leave the worktree");
+
+    // And the same worktree, once clean, is still removed — so a blanket
+    // `exit 0` can't satisfy this test either.
+    repo.run_git_in(&live, &["checkout", "--", "file.txt"]);
+    let output = run_hook(&live);
+    assert!(
+        output.status.success(),
+        "hook must remove a live worktree; {}",
+        describe(&output)
+    );
+    assert!(!live.exists(), "the hook must remove a real worktree");
+}
+
+/// The plugin's `PermissionRequest` command answers Claude Code's
+/// `EnterWorktree` confirmation for a worktree at worktrunk's managed location
+/// in the repository the payload's `cwd` is in, so a background session doesn't
+/// wait at it (#4149), and otherwise sets the 💬 marker as before (design:
+/// skills/wt-switch-create/rationale.md, "The confirmation hook").
+///
+/// An approval prints the allow decision and leaves the marker unset, since no
+/// dialog waits. Each case that declines differs from an approved one in a
+/// single input — the tool, a worktree off the `worktree-path` template, the
+/// repository of the `cwd` — and must print nothing, so the dialog stays, and
+/// set 💬. The `cwd` pair shares its worktree, which pins that the session's
+/// directory decides. It runs the real command out of `hooks.json`.
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+#[rstest]
+fn test_permission_request_hook_approves_entering_managed_worktrees(mut repo: TestRepo) {
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::Stdio;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hooks_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("plugins/worktrunk/hooks/hooks.json")).unwrap(),
+    )
+    .unwrap();
+    let command = hooks_json["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("PermissionRequest hook must define a command")
+        .to_owned();
+
+    let feature = repo.add_worktree("feature");
+    // A symlinked spelling of the same worktree, as macOS `/tmp` is of
+    // `/private/tmp`.
+    let feature_link = repo.home_path().join("feature-link");
+    std::os::unix::fs::symlink(&feature, &feature_link).unwrap();
+    // Registered like any worktree, but not where the template puts its branch.
+    let stray = repo.add_worktree_at_path("stray", &repo.home_path().join("stray"));
+    let mut other = TestRepo::standard();
+    let other_feature = other.add_worktree("other-feature");
+
+    let marker_key = format!("worktrunk.state.{}.marker", repo.current_branch());
+    let marker = || -> String {
+        repo.git_command()
+            .args(["config", "--get", &marker_key])
+            .run()
+            .map_or_else(
+                |_| String::new(),
+                |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            )
+    };
+
+    // Fire the hook as Claude Code does: the payload on stdin, the plugin root
+    // and the launch project dir in the environment. Returns stdout and the
+    // marker the call left, starting from none.
+    let run_hook = |tool: &str, cwd: &Path, path: &Path| -> (String, String) {
+        let _ = repo
+            .git_command()
+            .args(["config", "--unset", &marker_key])
+            .run();
+        let mut cmd = std::process::Command::new("bash");
+        repo.configure_wt_cmd(&mut cmd);
+        let mut child = cmd
+            .args(["-c", &command])
+            .env("WORKTRUNK_BIN", crate::common::wt_bin())
+            .env("CLAUDE_PLUGIN_ROOT", root.join("plugins/worktrunk"))
+            .env("CLAUDE_PROJECT_DIR", repo.root_path())
+            .current_dir(repo.root_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn bash");
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": tool,
+            "cwd": cwd,
+            "tool_input": { "path": path },
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the hook command must exit 0 for {tool} {}; got {}\nstderr:\n{}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            marker(),
+        )
+    };
+
+    for (cwd, path) in [
+        (repo.root_path(), feature.as_path()),
+        (repo.root_path(), feature_link.as_path()),
+        (other.root_path(), other_feature.as_path()),
+    ] {
+        let (stdout, marker) = run_hook("EnterWorktree", cwd, path);
+        let decision: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("expected an allow decision, got {stdout:?}: {e}"));
+        assert_eq!(
+            decision["hookSpecificOutput"],
+            serde_json::json!({
+                "hookEventName": "PermissionRequest",
+                "decision": { "behavior": "allow" },
+            }),
+            "entering {} from {} must be approved",
+            path.display(),
+            cwd.display()
+        );
+        assert!(
+            marker.is_empty(),
+            "an approved entry shows no dialog, so it must not set the marker; got {marker:?}"
+        );
+    }
+
+    for (tool, cwd, path) in [
+        ("Bash", repo.root_path(), feature.as_path()),
+        ("EnterWorktree", repo.root_path(), stray.as_path()),
+        ("EnterWorktree", repo.root_path(), other_feature.as_path()),
+    ] {
+        let (stdout, marker) = run_hook(tool, cwd, path);
+        assert!(
+            stdout.is_empty(),
+            "{tool} {} must get no decision, leaving the dialog; got {stdout:?}",
+            path.display()
+        );
+        assert!(
+            marker.contains('💬'),
+            "{tool} {} leaves a dialog waiting, so it must set 💬; got {marker:?}",
+            path.display()
+        );
+    }
+}
+
+// ==================== Plugin Install-Statusline Tests ====================
+
+#[rstest]
+fn test_plugins_claude_install_statusline(repo: TestRepo, temp_home: TempDir) {
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+
+        // Verify the file was written correctly
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["statusLine"]["command"],
+            "wt list statusline --format=claude-code"
+        );
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_statusline_already_configured(repo: TestRepo, temp_home: TempDir) {
+    TestRepo::setup_statusline_configured(temp_home.path());
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// A foreign statusline that happens to spell `wt ` is still foreign, so
+/// install proceeds instead of reporting the statusline as already configured.
+#[rstest]
+fn test_plugins_claude_install_statusline_foreign_command(repo: TestRepo, temp_home: TempDir) {
+    let claude_dir = temp_home.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"statusLine":{"type":"command","command":"newt status --short"}}"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["statusLine"]["command"],
+            "wt list statusline --format=claude-code"
+        );
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_statusline_preserves_existing(repo: TestRepo, temp_home: TempDir) {
+    // Deliberately unsorted keys at both levels: installing the statusline
+    // must preserve the user's ordering as well as their values.
+    let claude_dir = temp_home.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"zebra":true,"existingKey":{"zulu":1,"alpha":2},"alpha":"last"}"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        insta::assert_snapshot!(content, @r#"
+        {
+          "zebra": true,
+          "existingKey": {
+            "zulu": 1,
+            "alpha": 2
+          },
+          "alpha": "last",
+          "statusLine": {
+            "type": "command",
+            "command": "wt list statusline --format=claude-code"
+          }
+        }
+        "#);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_statusline_empty_file(repo: TestRepo, temp_home: TempDir) {
+    // Write an empty settings.json (edge case: file exists but is empty)
+    let claude_dir = temp_home.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(claude_dir.join("settings.json"), "").unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+
+        // Verify the file was written correctly despite starting empty
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["statusLine"]["command"],
+            "wt list statusline --format=claude-code"
+        );
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_statusline_honors_claude_config_dir(
+    repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // Claude Code relocates its entire config tree under CLAUDE_CONFIG_DIR, so
+    // the statusline must land at $CLAUDE_CONFIG_DIR/settings.json, not
+    // ~/.claude/settings.json.
+    let config_dir = temp_home.path().join("custom-claude");
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "install-statusline failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Written under CLAUDE_CONFIG_DIR...
+    let settings_path = config_dir.join("settings.json");
+    let content = fs::read_to_string(&settings_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed["statusLine"]["command"],
+        "wt list statusline --format=claude-code"
+    );
+
+    // ...and NOT under the default ~/.claude.
+    assert!(
+        !temp_home.path().join(".claude/settings.json").exists(),
+        "settings.json must not be written to ~/.claude when CLAUDE_CONFIG_DIR is set"
+    );
+
+    // Detection reads the same relocated path: a second run sees it as configured.
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already configured"),
+        "second run should detect the relocated statusline as already configured"
+    );
+}
+
+#[rstest]
+#[case::tilde_slash("~/custom-claude", "custom-claude/settings.json")]
+#[case::bare_tilde("~", "settings.json")]
+fn test_plugins_claude_install_statusline_expands_tilde_in_claude_config_dir(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[case] config_dir: &str,
+    #[case] expected_settings: &str,
+) {
+    // A literal tilde in CLAUDE_CONFIG_DIR (which only reaches us when the
+    // variable is set outside a shell) is expanded against the home directory,
+    // not treated as a relative path under the cwd. A bare `~` names the home
+    // directory itself, so it has no `/` for a prefix strip to key on.
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "install-statusline failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The tilde expanded against <home>.
+    let settings_path = temp_home.path().join(expected_settings);
+    assert!(
+        settings_path.exists(),
+        "expected settings.json at {}",
+        settings_path.display()
+    );
+    let content = fs::read_to_string(&settings_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed["statusLine"]["command"],
+        "wt list statusline --format=claude-code"
+    );
+
+    // The tilde was not left literal: no `~` directory under the cwd.
+    assert!(
+        !repo.root_path().join("~").exists(),
+        "tilde must be expanded, not treated as a literal relative path"
+    );
+}
+
+#[rstest]
+fn test_plugins_claude_install_statusline_falls_back_to_dot_claude(
+    repo: TestRepo,
+    temp_home: TempDir,
+) {
+    // With CLAUDE_CONFIG_DIR unset, paths fall back to the default ~/.claude.
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.args(["config", "plugins", "claude", "install-statusline", "--yes"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "install-statusline failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let settings_path = temp_home.path().join(".claude/settings.json");
+    let content = fs::read_to_string(&settings_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed["statusLine"]["command"],
+        "wt list statusline --format=claude-code"
+    );
+}
+
+// ==================== Plugin Command Failure Tests ====================
+
+#[rstest]
+fn test_plugins_claude_install_command_fails(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Claude Code lists no plugins, so the install runs rather than
+    // short-circuiting, and its first command is the one that fails.
+    repo.setup_mock_claude_with_plugins_failing(MockResponse::output("[]"));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_install_second_step_fails(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_installed();
+
+    // Marketplace add succeeds but plugin install fails
+    let mock_bin = repo
+        .mock_bin_path()
+        .expect("setup_mock_ci_tools_unauthenticated creates mock-bin");
+    MockConfig::new("claude")
+        .command("plugin marketplace", MockResponse::exit(0))
+        .command("plugin list", MockResponse::output("[]"))
+        .command(
+            "plugin install",
+            MockResponse::exit(1).with_stderr("error: install failed\n"),
+        )
+        .write(mock_bin);
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "install", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[rstest]
+fn test_plugins_claude_uninstall_command_fails(mut repo: TestRepo, temp_home: TempDir) {
+    repo.setup_mock_ci_tools_unauthenticated();
+    // Claude Code still lists the plugin after the failed removal, which is
+    // what makes the failure genuine rather than an already-finished job.
+    repo.setup_mock_claude_with_plugins_failing(MockResponse::output(
+        TestRepo::CLAUDE_PLUGINS_WITH_WORKTRUNK,
+    ));
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// `claude plugin uninstall` succeeds and the marketplace removal that follows
+/// it fails: the uninstall surfaces claude's error rather than reporting a
+/// marketplace it never removed.
+#[rstest]
+fn test_plugins_claude_uninstall_second_step_fails(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    repo.setup_mock_claude_installed();
+
+    // Plugin uninstall succeeds and only the marketplace removal that follows
+    // it fails, so the error the command surfaces can come from nothing else.
+    // Claude Code still lists the marketplace afterwards, which is what makes
+    // this a genuine failure rather than the already-gone state
+    // `test_plugins_claude_uninstall_tolerates_absent_marketplace` covers.
+    let mock_bin = repo
+        .mock_bin_path()
+        .expect("setup_mock_ci_tools_unauthenticated creates mock-bin");
+    MockConfig::new("claude")
+        .command("plugin uninstall", MockResponse::exit(0))
+        .command(
+            "plugin marketplace remove",
+            MockResponse::exit(1).with_stderr("error: marketplace remove failed\n"),
+        )
+        .command(
+            "plugin marketplace list",
+            MockResponse::output(TestRepo::CLAUDE_MARKETPLACES_WITH_WORKTRUNK),
+        )
+        .write(mock_bin);
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["config", "plugins", "claude", "uninstall", "--yes"])
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+// ==================== Plugin Prompt PTY Tests ====================
+
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+mod plugin_prompt_pty {
+    use crate::common::pty::{build_pty_command, exec_cmd_in_pty_prompted};
+    use crate::common::{TestRepo, repo, temp_home, wt_bin};
+    use rstest::rstest;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Build env vars for plugin PTY tests, including mock binary PATH.
+    ///
+    /// HOME/XDG_CONFIG_HOME are NOT set here — `build_pty_command` handles them
+    /// via its `home_dir` parameter.
+    fn plugin_env_vars(repo: &TestRepo) -> Vec<(String, String)> {
+        let mut vars = repo.test_env_vars();
+
+        // Add mock binary PATH if configured
+        if let Some(mock_bin) = repo.mock_bin_path() {
+            vars.push((
+                "WORKTRUNK_TEST_MOCK_CONFIG_DIR".to_string(),
+                mock_bin.display().to_string(),
+            ));
+
+            // Prepend mock bin to PATH
+            let current_path =
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+            let mut paths: Vec<PathBuf> = std::env::split_paths(&current_path).collect();
+            paths.insert(0, mock_bin.to_path_buf());
+            let new_path = std::env::join_paths(&paths).unwrap();
+            vars.retain(|(k, _)| k != "PATH");
+            vars.push(("PATH".to_string(), new_path.to_string_lossy().to_string()));
+        }
+
+        // Mark claude as installed
+        vars.push((
+            "WORKTRUNK_TEST_CLAUDE_INSTALLED".to_string(),
+            "1".to_string(),
+        ));
+
+        vars
+    }
+
+    // --- install-statusline prompt tests ---
+
+    #[rstest]
+    fn test_plugins_claude_install_statusline_prompt_accept(repo: TestRepo, temp_home: TempDir) {
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "install-statusline"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["y\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Configure statusline"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            output.contains("Statusline configured"),
+            "Should confirm configuration. Output:\n{output}"
+        );
+
+        // Verify the file was actually written
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = std::fs::read_to_string(&settings_path)
+            .expect("settings.json should exist after accepting prompt");
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["statusLine"]["command"],
+            "wt list statusline --format=claude-code"
+        );
+    }
+
+    #[rstest]
+    fn test_plugins_claude_install_statusline_prompt_preview_then_accept(
+        repo: TestRepo,
+        temp_home: TempDir,
+    ) {
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "install-statusline"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        // Send "?" to trigger preview, then "y" on the re-prompted prompt
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["?\n", "y\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("statusLine"),
+            "Should show preview with statusLine JSON. Output:\n{output}"
+        );
+        assert!(
+            output.contains("Statusline configured"),
+            "Should confirm configuration after preview. Output:\n{output}"
+        );
+
+        // Verify the file was actually written
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        let content = std::fs::read_to_string(&settings_path)
+            .expect("settings.json should exist after accepting prompt");
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["statusLine"]["command"],
+            "wt list statusline --format=claude-code"
+        );
+    }
+
+    #[rstest]
+    fn test_plugins_claude_install_statusline_prompt_decline(repo: TestRepo, temp_home: TempDir) {
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "install-statusline"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["n\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Configure statusline"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            !output.contains("Statusline configured"),
+            "Should NOT configure when declined. Output:\n{output}"
+        );
+
+        // Verify the file was NOT written
+        let settings_path = temp_home.path().join(".claude/settings.json");
+        assert!(
+            !settings_path.exists(),
+            "settings.json should not exist after declining"
+        );
+    }
+
+    // --- install prompt tests ---
+
+    #[rstest]
+    fn test_plugins_claude_install_prompt_accept(mut repo: TestRepo, temp_home: TempDir) {
+        repo.setup_mock_ci_tools_unauthenticated();
+        repo.setup_mock_claude_with_plugins();
+
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "install"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["y\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Install Worktrunk plugin"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            output.contains("Plugin installed"),
+            "Should confirm installation. Output:\n{output}"
+        );
+    }
+
+    #[rstest]
+    fn test_plugins_claude_install_prompt_decline(mut repo: TestRepo, temp_home: TempDir) {
+        repo.setup_mock_ci_tools_unauthenticated();
+        repo.setup_mock_claude_with_plugins();
+
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "install"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["n\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Install Worktrunk plugin"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            !output.contains("Plugin installed"),
+            "Should NOT install when declined. Output:\n{output}"
+        );
+    }
+
+    // --- uninstall prompt tests ---
+
+    #[rstest]
+    fn test_plugins_claude_uninstall_prompt_accept(mut repo: TestRepo, temp_home: TempDir) {
+        repo.setup_mock_ci_tools_unauthenticated();
+        repo.setup_mock_claude_with_plugins();
+
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "uninstall"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["y\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Uninstall Worktrunk plugin"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            output.contains("Plugin & marketplace removed"),
+            "Should confirm uninstallation. Output:\n{output}"
+        );
+    }
+
+    #[rstest]
+    fn test_plugins_claude_uninstall_prompt_decline(mut repo: TestRepo, temp_home: TempDir) {
+        repo.setup_mock_ci_tools_unauthenticated();
+        repo.setup_mock_claude_with_plugins();
+
+        let env_vars = plugin_env_vars(&repo);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["config", "plugins", "claude", "uninstall"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["n\n"], "[y/N");
+
+        assert_eq!(exit_code, 0, "Command should succeed. Output:\n{output}");
+        assert!(
+            output.contains("Uninstall Worktrunk plugin"),
+            "Should show prompt. Output:\n{output}"
+        );
+        assert!(
+            !output.contains("Plugin & marketplace removed"),
+            "Should NOT uninstall when declined. Output:\n{output}"
+        );
+    }
+}
+
+// ============================================================================
+// --format=json
+// ============================================================================
+
+#[rstest]
+fn test_config_show_json(repo: TestRepo, temp_home: TempDir) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(
+        &system_config_path,
+        "[list]\nfull = true\njson-schema = 2\n",
+    )
+    .unwrap();
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", system_config_path);
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+
+    assert!(json["user"]["exists"].as_bool().unwrap());
+    assert!(json["user"]["path"].as_str().is_some());
+    assert!(json["user"]["config"].is_object());
+    assert_eq!(json["user"]["config"]["list"]["full"], true);
+
+    // Project config doesn't exist in this fixture
+    assert!(!json["project"]["exists"].as_bool().unwrap());
+}
+
+#[rstest]
+#[case::environment("WORKTRUNK_LIST__TIMEOUT_MS", "invalid", None)]
+#[case::environment_validation("WORKTRUNK_WORKTREE_PATH", "", None)]
+#[case::inline("", "", Some("list.timeout-ms=\"invalid\""))]
+fn test_config_show_json_allows_invalid_runtime_override(
+    repo: TestRepo,
+    temp_home: TempDir,
+    #[case] env_name: &str,
+    #[case] env_value: &str,
+    #[case] inline: Option<&str>,
+) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(&system_config_path, "[list]\nbranches = true\n").unwrap();
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "[list]\nfull = true\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", system_config_path);
+    if let Some(inline) = inline {
+        cmd.args(["--config-set", inline]);
+    } else {
+        cmd.env(env_name, env_value);
+    }
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "runtime overrides should warn without invalidating the source config: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["user"]["config"]["list"]["branches"], true);
+    assert_eq!(json["user"]["config"]["list"]["full"], true);
+}
+
+#[rstest]
+#[case::text(&["config", "show"], false, false)]
+#[case::json(&["config", "show", "--format=json"], false, false)]
+#[case::json_with_unrelated_env(&["config", "show", "--format=json"], true, false)]
+#[case::json_with_masking_env(&["config", "show", "--format=json"], false, true)]
+fn test_config_show_rejects_semantically_invalid_user_config(
+    repo: TestRepo,
+    #[case] args: &[&str],
+    #[case] with_unrelated_env: bool,
+    #[case] with_masking_env: bool,
+) {
+    fs::write(repo.test_config_path(), "worktree-path = \"\"\n").unwrap();
+
+    let mut cmd = repo.wt_command();
+    cmd.args(args);
+    if with_unrelated_env {
+        cmd.env("WORKTRUNK_LIST__FULL", "true");
+    } else if with_masking_env {
+        cmd.env("WORKTRUNK_WORKTREE_PATH", "../valid");
+    }
+    let output = cmd.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    if args.contains(&"--format=json") {
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("User config @"), "{stderr}");
+        assert!(stderr.contains("worktree-path cannot be empty"), "{stderr}");
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let user_section = stdout
+            .split("USER CONFIG")
+            .nth(1)
+            .and_then(|rest| rest.split("PROJECT CONFIG").next())
+            .unwrap();
+        assert!(user_section.contains("Invalid config"), "{stdout}");
+        assert!(
+            user_section.contains("worktree-path cannot be empty"),
+            "{stdout}"
+        );
+    }
+}
+
+#[rstest]
+#[case::text(&["config", "show"])]
+#[case::json(&["config", "show", "--format=json"])]
+fn test_config_show_rejects_semantically_invalid_system_config(
+    repo: TestRepo,
+    #[case] args: &[&str],
+) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+    let system_config_path = system_config_dir.path().join("config.toml");
+    fs::write(&system_config_path, "worktree-path = \"\"\n").unwrap();
+    fs::write(repo.test_config_path(), "worktree-path = \"../valid\"\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_SYSTEM_CONFIG_PATH", system_config_path)
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    if args.contains(&"--format=json") {
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("System config @"), "{stderr}");
+        assert!(stderr.contains("worktree-path cannot be empty"), "{stderr}");
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let system_section = stdout
+        .split("SYSTEM CONFIG")
+        .nth(1)
+        .and_then(|rest| rest.split("USER CONFIG").next())
+        .unwrap();
+    assert!(system_section.contains("Invalid config"), "{stdout}");
+    assert!(
+        system_section.contains("worktree-path cannot be empty"),
+        "{stdout}"
+    );
+}
+
+#[rstest]
+#[case::text(&["config", "show"])]
+#[case::json(&["config", "show", "--format=json"])]
+fn test_config_show_warns_once_for_missing_explicit_config(repo: TestRepo, #[case] args: &[&str]) {
+    let output = repo
+        .wt_command()
+        .args(["--config", "/nonexistent/worktrunk/config.toml"])
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("Config file not found").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[rstest]
+fn test_config_show_json_rejects_invalid_custom_column(repo: TestRepo, temp_home: TempDir) {
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "[list.custom-columns.ticket]\ntemplate = \"{{ branch }}\"\nwidth = 0\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr).ansi_strip(), @"✗ Invalid [list.custom-columns.ticket] width: must be at least 1");
+}
+
+#[rstest]
+fn test_config_show_json_rejects_invalid_system_config(repo: TestRepo, temp_home: TempDir) {
+    let system_config_path = repo.root_path().join("system-config.toml");
+    fs::write(&system_config_path, "invalid = [toml\n").unwrap();
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config_path);
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["system"]["exists"], true);
+    assert!(
+        json["user"]["config"].is_object(),
+        "a broken system source must not erase valid user config"
+    );
+    let mut settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    crate::common::add_path_placeholder_filter(
+        &mut settings,
+        r"_REPO_/system-config\.toml",
+        "[SYSTEM_CONFIG]",
+    );
+    settings.bind(|| {
+        insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr).ansi_strip(), @"
+        ▲ System config @ [SYSTEM_CONFIG] failed to parse, skipping
+          TOML parse error at line 1, column 16
+            |
+          1 | invalid = [toml
+            |                ^
+          unclosed array, expected `]`
+        ");
+    });
+}
+
+#[rstest]
+fn test_config_show_json_rejects_unreadable_system_config(repo: TestRepo, temp_home: TempDir) {
+    let system_config_dir = tempfile::tempdir().unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", system_config_dir.path());
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["system"]["exists"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("System config @"), "{stderr}");
+    assert!(stderr.contains("Cannot read config"), "{stderr}");
+}
+
+#[rstest]
+fn test_config_show_json_rejects_invalid_approvals_file(repo: TestRepo) {
+    fs::write(repo.test_approvals_path(), "not valid TOML [[[").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--format=json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    setup_snapshot_settings(&repo).bind(|| {
+        insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr).ansi_strip(), @"
+        ✗ Approvals @ [TEST_APPROVALS] failed to parse
+          TOML parse error at line 1, column 5
+            |
+          1 | not valid TOML [[[
+            |     ^
+          key with no value, expected `=`
+        ");
+    });
+}
+
+#[rstest]
+fn test_config_show_json_rejects_invalid_user_config(repo: TestRepo) {
+    fs::write(repo.test_config_path(), "invalid = [toml\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--format=json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["user"]["exists"], true);
+    assert!(json["user"]["config"].is_null());
+    setup_snapshot_settings(&repo).bind(|| {
+        insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr).ansi_strip(), @"
+        ▲ User config @ [TEST_CONFIG] failed to parse, skipping
+          TOML parse error at line 1, column 16
+            |
+          1 | invalid = [toml
+            |                ^
+          unclosed array, expected `]`
+        ");
+    });
+}
+
+#[rstest]
+fn test_config_show_json_rejects_unreadable_user_config(repo: TestRepo) {
+    fs::write(repo.test_config_path(), [0xff]).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--format=json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["user"]["exists"], true);
+    assert!(json["user"]["config"].is_null());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("User config @"), "{stderr}");
+    assert!(stderr.contains("Cannot read config"), "{stderr}");
+}
+
+#[rstest]
+fn test_config_show_json_rejects_invalid_project_config(repo: TestRepo) {
+    repo.write_project_config("invalid = [toml\n");
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--format=json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["project"]["exists"], true);
+    assert!(json["project"]["config"].is_null());
+    setup_snapshot_settings(&repo).bind(|| {
+        insta::assert_snapshot!(String::from_utf8_lossy(&output.stderr).ansi_strip(), @"
+        ✗ Project config @ _REPO_/.config/wt.toml failed to parse
+          TOML parse error at line 1, column 16
+            |
+          1 | invalid = [toml
+            |                ^
+          unclosed array, expected `]`
+        ");
+    });
+}
+
+#[rstest]
+fn test_config_show_json_rejects_unreadable_project_config(repo: TestRepo) {
+    repo.write_project_config("");
+    fs::write(repo.root_path().join(".config/wt.toml"), [0xff]).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show", "--format=json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert_eq!(json["project"]["exists"], true);
+    assert!(json["project"]["config"].is_null());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Project config @"), "{stderr}");
+    assert!(stderr.contains("Cannot read config"), "{stderr}");
+}
+
+#[rstest]
+fn test_config_show_json_with_project_config(repo: TestRepo, temp_home: TempDir) {
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(global_config_dir.join("config.toml"), "").unwrap();
+
+    // Create project config
+    let config_dir = repo.root_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[list]\nurl = \"http://localhost:3000\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+
+    assert!(json["project"]["exists"].as_bool().unwrap());
+    assert!(json["project"]["config"].is_object());
+}
+
+#[rstest]
+fn test_config_show_json_outside_repo(repo: TestRepo, temp_home: TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let global_config_dir = temp_home.path().join(".config").join("worktrunk");
+    fs::create_dir_all(&global_config_dir).unwrap();
+    fs::write(
+        global_config_dir.join("config.toml"),
+        "worktree-path = \"../{{ repo }}.{{ branch }}\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(temp_dir.path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+
+    assert!(json["user"]["exists"].as_bool().unwrap());
+    assert!(json["user"]["config"].is_object());
+
+    // Outside a repo: project path and config are null
+    assert!(json["project"]["path"].is_null());
+    assert!(!json["project"]["exists"].as_bool().unwrap());
+    assert!(json["project"]["config"].is_null());
+}
+
+/// `WORKTRUNK_PROJECT_CONFIG_PATH` overrides the default `.config/wt.toml`
+/// lookup. Mirrors `WORKTRUNK_CONFIG_PATH` / `WORKTRUNK_SYSTEM_CONFIG_PATH`
+/// for project config — used to isolate tests (including completion tests)
+/// from any `[aliases]` in the developer's own project config.
+#[rstest]
+fn test_project_config_path_env_var_override(repo: TestRepo, temp_home: TempDir) {
+    // Write a project config in the repo that should be *ignored* when the
+    // override points elsewhere.
+    let in_repo_config = repo.root_path().join(".config").join("wt.toml");
+    fs::create_dir_all(in_repo_config.parent().unwrap()).unwrap();
+    fs::write(&in_repo_config, "pre-start = \"in-repo-hook\"\n").unwrap();
+
+    // Write the override project config at an arbitrary path.
+    let override_dir = tempfile::tempdir().unwrap();
+    let override_path = override_dir.path().join("override.toml");
+    fs::write(&override_path, "pre-start = \"override-hook\"\n").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_PROJECT_CONFIG_PATH", &override_path);
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(
+        json["project"]["config"]["pre-start"], "override-hook",
+        "expected override config to be loaded, got: {}",
+        json["project"]
+    );
+
+    // And a missing override path resolves to no project config (same as a
+    // missing `.config/wt.toml`) — doesn't silently fall back to the repo's
+    // own file.
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env(
+        "WORKTRUNK_PROJECT_CONFIG_PATH",
+        override_dir.path().join("nonexistent.toml"),
+    );
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(
+        json["project"]["config"].is_null(),
+        "missing override path should resolve to no project config, got: {}",
+        json["project"]["config"]
+    );
+
+    // An empty override likewise means no project config — it must not fall
+    // back to the repo's own file or resolve to the worktree root directory.
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.env("WORKTRUNK_PROJECT_CONFIG_PATH", "");
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(
+        json["project"]["config"].is_null(),
+        "empty override should resolve to no project config, got: {}",
+        json["project"]["config"]
+    );
+}
+
+/// A relative `WORKTRUNK_PROJECT_CONFIG_PATH` resolves against the worktree
+/// root — the same anchor as the default `.config/wt.toml` — so the override
+/// behaves identically from any subdirectory instead of silently depending on
+/// the process cwd, and each worktree anchors to its own root.
+#[rstest]
+fn test_project_config_path_env_var_relative(mut repo: TestRepo, temp_home: TempDir) {
+    fs::write(
+        repo.root_path().join("custom-wt.toml"),
+        "pre-start = \"custom-hook\"\n",
+    )
+    .unwrap();
+    let subdir = repo.root_path().join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    // A linked worktree carries its own config file at the same relative
+    // location; running there must load that file, not the main worktree's.
+    let linked = repo.add_worktree("linked-anchor");
+    fs::write(
+        linked.join("custom-wt.toml"),
+        "pre-start = \"linked-hook\"\n",
+    )
+    .unwrap();
+
+    let cases = [
+        (
+            repo.root_path().to_path_buf(),
+            repo.root_path().to_path_buf(),
+            "custom-hook",
+        ),
+        (subdir, repo.root_path().to_path_buf(), "custom-hook"),
+        (linked.clone(), linked, "linked-hook"),
+    ];
+    for (cwd, expected_root, expected_hook) in &cases {
+        let mut cmd = repo.wt_command();
+        set_xdg_config_path(&mut cmd, temp_home.path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_PROJECT_CONFIG_PATH", "custom-wt.toml");
+        cmd.args(["config", "show", "--format=json"])
+            .current_dir(cwd);
+
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        assert_eq!(
+            json["project"]["path"].as_str().unwrap(),
+            expected_root.join("custom-wt.toml").to_str().unwrap(),
+            "relative override should anchor to the worktree root from {cwd:?}"
+        );
+        assert_eq!(
+            json["project"]["config"]["pre-start"], *expected_hook,
+            "relative override should load the root-anchored config from {cwd:?}, got: {}",
+            json["project"]
+        );
+    }
+}
+
+/// A relative `WORKTRUNK_PROJECT_CONFIG_PATH` with no worktree root to anchor
+/// it (bare repo, no linked worktrees) errors instead of silently resolving
+/// against the process cwd.
+#[test]
+fn test_project_config_path_env_var_relative_no_worktree_errors() {
+    let test = BareRepoTest::new();
+
+    let mut cmd = test.wt_command();
+    cmd.env("WORKTRUNK_PROJECT_CONFIG_PATH", "custom-wt.toml");
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a relative override without a worktree root should fail; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("WORKTRUNK_PROJECT_CONFIG_PATH is relative"),
+        "error should name the env var and the problem; stderr:\n{stderr}"
+    );
+
+    // Without the override, the same repo has no project config location at
+    // all; `wt config update` skips the project config rather than erroring,
+    // and `wt config show` reports the absence rather than claiming to be
+    // outside a git repository.
+    let mut cmd = test.wt_command();
+    cmd.args(["config", "update", "--yes"])
+        .current_dir(test.bare_repo_path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "config update should skip a missing project config location; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut cmd = test.wt_command();
+    cmd.args(["config", "show"])
+        .current_dir(test.bare_repo_path());
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "config show should succeed with no project config location; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("No project config"),
+        "config show should report the missing project config location; stdout:\n{stdout}"
+    );
+}
+
+/// On Windows, an override that is neither fully absolute nor relative — a
+/// drive-relative (`C:cfg`) or rooted-but-driveless (`\cfg`) value — errors
+/// instead of silently resolving against the process drive or cwd.
+#[cfg(windows)]
+#[rstest]
+fn test_project_config_path_env_var_half_anchored_errors(repo: TestRepo) {
+    for value in [r"C:cfg\wt.toml", r"\cfg\wt.toml"] {
+        let mut cmd = repo.wt_command();
+        cmd.env("WORKTRUNK_PROJECT_CONFIG_PATH", value);
+        cmd.args(["config", "show", "--format=json"]);
+
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "override {value} should be rejected; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("neither fully absolute nor relative"),
+            "error should explain the rejected form for {value}; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// A deprecated config whose migration diff `wt config show` renders.
+const DEPRECATED_CONFIG_FOR_DIFF: &str = r#"worktree-path = "../{{ main_worktree }}.{{ branch }}"
+"#;
+
+/// Worktrunk renders its own migration patch, so a user's `diff.external`
+/// program must not be consulted — a broken or interactive one would otherwise
+/// replace or suppress the proposed diff.
+#[rstest]
+fn test_config_show_migration_diff_ignores_external_diff(repo: TestRepo) {
+    fs::write(repo.test_config_path(), DEPRECATED_CONFIG_FOR_DIFF).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show"])
+        // Appended to the hermetic test git config (keys 0 and 1).
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_2", "diff.external")
+        .env("GIT_CONFIG_VALUE_2", "wt-nonexistent-external-diff")
+        .output()
+        .unwrap();
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let stdout = raw.ansi_strip();
+    assert!(
+        stdout.contains("Proposed diff:") && stdout.contains("{{ repo }}"),
+        "expected the migration patch, got:\n{stdout}"
+    );
+}
+
+/// A `git diff --no-index` that fails outright must not read as "no changes":
+/// the preview says so instead of silently dropping the patch.
+#[rstest]
+fn test_config_show_reports_failed_migration_diff(repo: TestRepo) {
+    fs::write(repo.test_config_path(), DEPRECATED_CONFIG_FOR_DIFF).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["config", "show"])
+        // An unparsable `diff.*` value fails git after option parsing, which
+        // `--no-ext-diff` cannot prevent.
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_2", "diff.algorithm")
+        .env("GIT_CONFIG_VALUE_2", "wt-nonexistent-diff-algorithm")
+        .output()
+        .unwrap();
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let stdout = raw.ansi_strip();
+    assert!(
+        stdout.contains("Could not render the proposed diff"),
+        "expected the failure to be reported, got:\n{stdout}"
+    );
+}
+
+/// A non-UTF-8 environment entry must not panic config loading.
+#[cfg(unix)]
+#[rstest]
+fn test_config_show_non_utf8_environment(repo: TestRepo) {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let output = repo
+        .wt_command()
+        .env("UNRELATED", OsString::from_vec(vec![0xff]))
+        .env(OsString::from_vec(b"UNRELATED_\xff".to_vec()), "value")
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// An unreadable config must stop a mutation before it uses default settings.
+#[rstest]
+#[case("WORKTRUNK_CONFIG_PATH", false)]
+#[case("WORKTRUNK_SYSTEM_CONFIG_PATH", false)]
+#[case("WORKTRUNK_CONFIG_PATH", true)]
+#[case("WORKTRUNK_SYSTEM_CONFIG_PATH", true)]
+fn test_unreadable_config_stops_switch(
+    repo: TestRepo,
+    #[case] variable: &str,
+    #[case] invalid_utf8: bool,
+) {
+    let scratch = crate::common::test_tempdir();
+    let config = scratch.path().join("unreadable.toml");
+    if invalid_utf8 {
+        fs::write(&config, [0xff]).unwrap();
+    } else {
+        fs::create_dir(&config).unwrap();
+    }
+    let output = repo
+        .wt_command()
+        .env(variable, &config)
+        .args(["switch", "--create", "unreadable-config", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Failed to read"), "{stderr}");
+    assert!(stderr.contains("unreadable.toml"), "{stderr}");
+    let branch = repo
+        .git_command()
+        .args(["show-ref", "--verify", "refs/heads/unreadable-config"])
+        .run()
+        .unwrap();
+    assert!(
+        !branch.status.success(),
+        "branch was created despite unreadable config"
+    );
+}

@@ -1,0 +1,2420 @@
+use crate::common::{
+    BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, canonicalize,
+    configure_directive_file, configure_git_cmd, configure_git_env, directive_file, repo,
+    setup_temp_snapshot_settings, wait_for_file, wait_for_file_content, wait_for_worktree_removed,
+    wt_command,
+};
+use insta_cmd::assert_cmd_snapshot;
+use rstest::rstest;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use worktrunk::shell_exec::Cmd;
+
+#[test]
+fn test_bare_repo_list_worktrees() {
+    let test = BareRepoTest::new();
+
+    // Create worktrees inside bare repo matching template: {{ branch }}
+    // Worktrees are at repo/main and repo/feature
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit on main");
+
+    let feature_worktree = test.create_worktree("feature", "feature");
+    test.commit_in(&feature_worktree, "Work on feature");
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        // Run wt list from the main worktree
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(&main_worktree);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[test]
+fn test_bare_repo_list_shows_no_bare_entry() {
+    let test = BareRepoTest::new();
+
+    // Create one worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Run wt list and verify bare repo is NOT shown (only main worktree appears)
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(&main_worktree);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// A bare repo carrying branches but no worktrees — the shape `git clone
+/// --bare` leaves, and the only shape where `git worktree list` reports
+/// nothing once the bare entry is filtered out.
+fn bare_repo_without_worktrees() -> BareRepoTest {
+    let test = BareRepoTest::new();
+
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+    test.create_worktree("feature", "feature");
+
+    // Detach both branches from their worktrees: `main` and `feature` remain in
+    // the bare repo, and nothing is registered as a worktree.
+    test.run_git_in(test.bare_repo_path(), &["worktree", "remove", "feature"]);
+    test.run_git_in(test.bare_repo_path(), &["worktree", "remove", "main"]);
+
+    test
+}
+
+/// `wt list` in a bare repo with no worktrees exits 0 and names the state on
+/// stderr: the `○ No worktrees` line and the hint under it. Stdout stays
+/// empty because the table has no rows and a lone header would be noise to
+/// anything piping it.
+#[test]
+fn test_bare_repo_list_no_worktrees() {
+    let test = bare_repo_without_worktrees();
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(test.bare_repo_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// `--path` naming the bare repository itself is refused, even with
+/// `--clobber`, which would otherwise move the repository aside and strand
+/// every worktree's gitfile on the backup.
+#[test]
+fn test_bare_repo_switch_path_rejects_the_repository() {
+    let test = bare_repo_without_worktrees();
+    let bare = test.bare_repo_path();
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.args([
+            "switch",
+            "--create",
+            "feature-b",
+            "--clobber",
+            "--path",
+            ".",
+        ])
+        .current_dir(bare);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    assert!(bare.join("HEAD").is_file());
+    let siblings: Vec<_> = fs::read_dir(bare.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().contains(".bak."))
+        .collect();
+    assert!(siblings.is_empty(), "unexpected backup: {siblings:?}");
+}
+
+/// `--format json` owes its consumer a payload in the same state: the schema-2
+/// envelope with `items: []`, not an empty stdout that no parser accepts.
+#[test]
+fn test_bare_repo_list_no_worktrees_json() {
+    let test = bare_repo_without_worktrees();
+    fs::write(
+        test.config_path(),
+        "worktree-path = \"{{ branch }}\"\n\n[list]\njson-schema = 2\n",
+    )
+    .unwrap();
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.args(["list", "--format", "json"])
+            .current_dir(test.bare_repo_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The branches are still listable with no worktree to anchor them: `wt list
+/// --branches` renders its rows, and the empty-worktree message stays out of
+/// the way because the listing isn't empty.
+#[test]
+fn test_bare_repo_list_no_worktrees_branches() {
+    let test = bare_repo_without_worktrees();
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.args(["list", "--branches"])
+            .current_dir(test.bare_repo_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// A bare repo with no commits at all — `git init --bare -b main`, before
+/// anything is pushed to it. The empty listing is the whole output: nothing
+/// was deleted here, so the stale-default-branch warning must stay silent even
+/// though `refs/heads/main` doesn't exist. `infer_default_branch_locally`
+/// resolves `symbolic-ref HEAD`, which names `main` regardless, and warning
+/// would send the user to `wt config state default-branch clear` — a remedy
+/// that loops, because the next run re-infers the same value from `HEAD`.
+#[test]
+fn test_bare_repo_list_no_commits() {
+    let test = BareRepoTest::new();
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(test.bare_repo_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[test]
+fn test_bare_repo_switch_creates_worktree() {
+    let test = BareRepoTest::new();
+
+    // Create initial worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Run wt switch --create to create a new worktree
+    // Config uses {{ branch }} template, so worktrees are created inside bare repo
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify the new worktree was created inside the bare repo
+    // Template: {{ branch }} -> repo/feature
+    let expected_path = test.bare_repo_path().join("feature");
+    assert!(
+        expected_path.exists(),
+        "Expected worktree at {:?}",
+        expected_path
+    );
+
+    // Verify git worktree list shows both worktrees (but not bare repo)
+    let output = test
+        .git_command(test.bare_repo_path())
+        .args(["worktree", "list"])
+        .run()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should show 3 entries: bare repo + 2 worktrees
+    assert_eq!(stdout.lines().count(), 3);
+}
+
+#[test]
+fn test_bare_repo_switch_with_configured_naming() {
+    let test = BareRepoTest::new();
+
+    // Create initial worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Config uses "{{ branch }}" template, so worktrees are created inside bare repo
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify worktree was created inside bare repo
+    let expected_path = test.bare_repo_path().join("feature");
+    assert!(
+        expected_path.exists(),
+        "Expected worktree at {:?}",
+        expected_path
+    );
+}
+
+#[test]
+fn test_bare_repo_remove_worktree() {
+    let test = BareRepoTest::new();
+
+    // Create two worktrees
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    let feature_worktree = test.create_worktree("feature", "feature");
+    test.commit_in(&feature_worktree, "Feature work");
+
+    // Remove feature worktree from main worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["remove", "feature", "--foreground"])
+        .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt remove failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify feature worktree was removed
+    assert!(
+        !feature_worktree.exists(),
+        "Feature worktree should be removed"
+    );
+
+    // Verify main worktree still exists
+    assert!(main_worktree.exists());
+}
+
+#[test]
+fn test_bare_repo_identifies_primary_correctly() {
+    let test = BareRepoTest::new();
+
+    // Create multiple worktrees
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Main commit");
+
+    let _feature1 = test.create_worktree("feature1", "feature1");
+    let _feature2 = test.create_worktree("feature2", "feature2");
+
+    // Run wt list to see which is marked as primary
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(&main_worktree);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[test]
+fn test_bare_repo_path_used_for_worktree_paths() {
+    let test = BareRepoTest::new();
+
+    // Create initial worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Create new worktree - config uses {{ branch }} template
+    // Worktrees are created inside the bare repo directory
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "dev"])
+        .current_dir(&main_worktree);
+
+    cmd.output().unwrap();
+
+    // Verify path is created inside bare repo (using repo_path as base)
+    // Template: {{ branch }} -> repo/dev
+    let expected = test.bare_repo_path().join("dev");
+    assert!(
+        expected.exists(),
+        "Worktree should be created using repo_path: {:?}",
+        expected
+    );
+
+    // Should NOT be relative to main worktree's directory (as if it were a non-bare repo)
+    let wrong_path = main_worktree.parent().unwrap().join("main.dev");
+    assert!(
+        !wrong_path.exists(),
+        "Worktree should not use worktree directory as base"
+    );
+}
+
+#[test]
+fn test_bare_repo_with_repo_path_variable() {
+    // Test that {{ repo_path }} resolves correctly in bare repos
+    // For bare repos, repo_path should be the bare repo directory itself
+    let test = BareRepoTest::new();
+
+    // Override config to use {{ repo_path }} explicitly
+    fs::write(
+        test.config_path(),
+        "worktree-path = \"{{ repo_path }}/../worktrees/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    // Create initial worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Create new worktree using wt switch
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature/auth"])
+        .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify worktree was created at sibling path using {{ repo_path }}/../worktrees/
+    // Bare repo is at /tmp/xxx/repo, so worktree should be at /tmp/xxx/worktrees/feature-auth
+    let expected_path = test
+        .bare_repo_path()
+        .parent()
+        .unwrap()
+        .join("worktrees")
+        .join("feature-auth");
+    assert!(
+        expected_path.exists(),
+        "Expected worktree at {:?} (using repo_path variable)",
+        expected_path
+    );
+}
+
+/// Regression test for #1914: when `wt` is invoked via a git shell alias
+/// (`alias.wt = "!wt"`), git exports `GIT_DIR` — sometimes as a *relative*
+/// path like `.git`. That relative path would otherwise re-resolve against
+/// every child command's `current_dir`, breaking worktrunk's repo discovery
+/// in bare-layout repositories. Worktrunk normalizes inherited relative
+/// `GIT_*` path variables at startup so `{{ repo_path }}` resolves
+/// identically whether `wt` is invoked directly or via a git alias.
+#[test]
+fn test_bare_repo_repo_path_with_inherited_relative_git_dir() {
+    let test = BareRepoTest::new();
+
+    // Configure a user-level alias that prints repo_path. We use user config
+    // (not project config) so it's discoverable even when the command is
+    // launched from the bare repo's parent directory.
+    let user_config = test.temp_path().join("user-config.toml");
+    fs::write(
+        &user_config,
+        "[aliases]\nprint-repo-path = \"echo REPO_PATH={{ repo_path }}\"\n",
+    )
+    .unwrap();
+
+    // Create a linked worktree so there's somewhere to run from.
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Helper: run `wt step print-repo-path` and extract the
+    // `REPO_PATH=...` value emitted by the alias. We compare these as-is
+    // so platform-specific path formatting (e.g. msys-style paths that
+    // Git Bash uses on Windows for `echo`) doesn't affect the test — we
+    // only assert that both invocations produce the *same* value.
+    // No `-y` needed: user-config aliases skip approval entirely.
+    let extract_repo_path = |out: &std::process::Output| -> String {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        combined
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("REPO_PATH=").map(str::to_owned))
+            .unwrap_or_else(|| panic!("no REPO_PATH= line in output:\n{combined}"))
+    };
+
+    // Baseline: invoke `wt` normally from the main worktree.
+    let mut baseline = wt_command();
+    test.configure_wt_cmd(&mut baseline);
+    baseline
+        .env("WORKTRUNK_CONFIG_PATH", &user_config)
+        .args(["step", "print-repo-path"])
+        .current_dir(&main_worktree);
+    let baseline_out = baseline.output().unwrap();
+    assert!(
+        baseline_out.status.success(),
+        "baseline wt failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&baseline_out.stdout),
+        String::from_utf8_lossy(&baseline_out.stderr)
+    );
+    let baseline_repo_path = extract_repo_path(&baseline_out);
+
+    // Simulate a git alias invocation: git sets GIT_DIR (and GIT_PREFIX) for
+    // shell aliases. From a linked worktree, git sets GIT_DIR to the
+    // per-worktree admin dir — use a relative spelling to exercise the bug.
+    let worktree_git_dir = test.bare_repo_path().join("worktrees").join("main");
+    assert!(
+        worktree_git_dir.exists(),
+        "expected linked worktree admin dir at {worktree_git_dir:?}"
+    );
+    // Relative path from main_worktree to its per-worktree admin dir.
+    let relative_git_dir = PathBuf::from("..").join("worktrees").join("main");
+
+    let mut via_alias = wt_command();
+    test.configure_wt_cmd(&mut via_alias);
+    via_alias
+        .env("WORKTRUNK_CONFIG_PATH", &user_config)
+        .env("GIT_DIR", &relative_git_dir)
+        .env("GIT_PREFIX", "")
+        .args(["step", "print-repo-path"])
+        .current_dir(&main_worktree);
+    let via_alias_out = via_alias.output().unwrap();
+    assert!(
+        via_alias_out.status.success(),
+        "wt via git alias failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&via_alias_out.stdout),
+        String::from_utf8_lossy(&via_alias_out.stderr)
+    );
+    let via_alias_repo_path = extract_repo_path(&via_alias_out);
+
+    assert_eq!(
+        baseline_repo_path, via_alias_repo_path,
+        "repo_path differed when invoked via a simulated git alias \
+         (relative GIT_DIR was not normalized — see #1914)"
+    );
+}
+
+/// Companion to `test_bare_repo_repo_path_with_inherited_relative_git_dir`
+/// that exercises the full `git wt …` → `sh -c` → `wt` path using a *real*
+/// git alias instead of hand-crafted `GIT_*` env vars.
+///
+/// To actually trigger #1914, the layout must match the issue reporter's:
+/// `repo/.git` is the bare repository and `repo/main` is a linked worktree.
+/// Running `git wt …` from `repo/` causes git to export `GIT_DIR=.git`
+/// (relative), which is the bug vector — `BareRepoTest` uses a different
+/// layout (`repo/` *is* the bare) where git exports an absolute `GIT_DIR`
+/// and the bug doesn't reproduce, so we build the layout by hand here.
+///
+/// Unix-only: git aliases execute via `sh -c`, and shell-quoting the wt
+/// binary path for Windows' bundled sh is fiddly. The underlying fix in
+/// `shell_exec.rs` has no platform-specific code, so the simulated-env
+/// companion test still exercises the normalization on Windows.
+#[cfg(not(windows))]
+#[test]
+fn test_repo_path_via_real_git_alias_bare_dot_git_layout() {
+    use crate::common::{configure_git_env, wt_bin};
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_path = canonicalize(temp_dir.path()).unwrap();
+
+    // Layout: repo/.git (bare) + repo/main (linked worktree).
+    let repo_dir = temp_path.join("repo");
+    fs::create_dir(&repo_dir).unwrap();
+    let bare_git = repo_dir.join(".git");
+
+    let git = |dir: &Path| configure_git_env(Cmd::new("git")).current_dir(dir);
+
+    git(&temp_path)
+        .args(["init", "--bare", "--initial-branch", "main"])
+        .arg(bare_git.to_str().unwrap())
+        .run()
+        .unwrap();
+    git(&bare_git)
+        .args(["worktree", "add", "../main"])
+        .run()
+        .unwrap();
+
+    let main_worktree = repo_dir.join("main");
+    fs::write(main_worktree.join("a.txt"), "hello").unwrap();
+    git(&main_worktree).args(["add", "a.txt"]).run().unwrap();
+    git(&main_worktree)
+        .args(["commit", "-m", "Initial commit"])
+        .run()
+        .unwrap();
+
+    // wt config with worktree-path template and the `print-repo-path` alias.
+    let user_config = temp_path.join("test-config.toml");
+    fs::write(
+        &user_config,
+        "worktree-path = \"{{ branch }}\"\n\
+         [aliases]\nprint-repo-path = \"echo REPO_PATH={{ repo_path }}\"\n",
+    )
+    .unwrap();
+    let approvals_path = temp_path.join("test-approvals.toml");
+
+    // Register the real git alias in the bare repo's config.
+    let wt_path = wt_bin();
+    let wt_path_lossy = wt_path.to_string_lossy();
+    let wt_path_escaped = shell_escape::unix::escape(wt_path_lossy);
+    git(&bare_git)
+        .args(["config", "alias.wt", &format!("!{wt_path_escaped}")])
+        .run()
+        .unwrap();
+
+    let extract_repo_path = |out: &std::process::Output| -> String {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        combined
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("REPO_PATH=").map(str::to_owned))
+            .unwrap_or_else(|| panic!("no REPO_PATH= line in output:\n{combined}"))
+    };
+
+    // Shared wt env applied to both the direct and aliased invocations.
+    let apply_wt_env = |cmd: &mut Command| {
+        configure_git_cmd(cmd);
+        cmd.env("WORKTRUNK_CONFIG_PATH", &user_config)
+            .env(
+                "WORKTRUNK_SYSTEM_CONFIG_PATH",
+                "/etc/xdg/worktrunk/config.toml",
+            )
+            .env("WORKTRUNK_APPROVALS_PATH", &approvals_path)
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR_FORCE");
+    };
+
+    // Baseline: invoke `wt` directly from `repo/`. Git discovers the bare
+    // `.git` automatically without exporting any `GIT_*` path vars.
+    let mut baseline = Command::new(wt_bin());
+    apply_wt_env(&mut baseline);
+    baseline
+        .args(["step", "print-repo-path"])
+        .current_dir(&repo_dir);
+    let baseline_out = baseline.output().unwrap();
+    assert!(
+        baseline_out.status.success(),
+        "baseline wt failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&baseline_out.stdout),
+        String::from_utf8_lossy(&baseline_out.stderr)
+    );
+    let baseline_repo_path = extract_repo_path(&baseline_out);
+
+    // Via the real git alias: `git wt step print-repo-path`. From the
+    // `repo/` dir (not inside the worktree), git sets `GIT_DIR=.git`
+    // (relative) when exporting the alias environment — the exact bug vector
+    // from #1914.
+    let mut via_alias = Command::new("git");
+    apply_wt_env(&mut via_alias);
+    via_alias
+        .args(["wt", "step", "print-repo-path"])
+        .current_dir(&repo_dir);
+    let via_alias_out = via_alias.output().unwrap();
+    assert!(
+        via_alias_out.status.success(),
+        "git wt via real alias failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&via_alias_out.stdout),
+        String::from_utf8_lossy(&via_alias_out.stderr)
+    );
+    let via_alias_repo_path = extract_repo_path(&via_alias_out);
+
+    assert_eq!(
+        baseline_repo_path, via_alias_repo_path,
+        "repo_path differed when invoked via a real `git wt` alias — see #1914"
+    );
+}
+
+#[rstest]
+fn test_bare_repo_equivalent_to_normal_repo(repo: TestRepo) {
+    // This test verifies that bare repos behave identically to normal repos
+    // from the user's perspective
+
+    // Remove fixture worktrees to get a clean state with just main
+    for branch in &["feature-a", "feature-b", "feature-c"] {
+        let worktree_path = repo
+            .root_path()
+            .parent()
+            .unwrap()
+            .join(format!("repo.{}", branch));
+        if worktree_path.exists() {
+            repo.git_command()
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .run()
+                .unwrap();
+        }
+    }
+
+    // Set up bare repo
+    let bare_test = BareRepoTest::new();
+    let bare_main = bare_test.create_worktree("main", "main");
+    bare_test.commit_in(&bare_main, "Commit in bare repo");
+
+    // Set up normal repo (using fixture)
+    repo.commit("Commit in normal repo");
+
+    // Configure both with same worktree path pattern
+    let config = r#"
+worktree-path = "{{ branch }}"
+"#;
+    fs::write(bare_test.config_path(), config).unwrap();
+    fs::write(repo.test_config_path(), config).unwrap();
+
+    // List worktrees in both - should show similar structure
+    let mut bare_list = wt_command();
+    bare_test.configure_wt_cmd(&mut bare_list);
+    bare_list.arg("list").current_dir(&bare_main);
+
+    let mut normal_list = wt_command();
+    repo.configure_wt_cmd(&mut normal_list);
+    normal_list.arg("list").current_dir(repo.root_path());
+
+    let bare_output = bare_list.output().unwrap();
+    let normal_output = normal_list.output().unwrap();
+
+    // Both should show 1 worktree (main/main) - table output is on stdout
+    let bare_stdout = String::from_utf8_lossy(&bare_output.stdout);
+    let normal_stdout = String::from_utf8_lossy(&normal_output.stdout);
+
+    assert!(bare_stdout.contains("main"));
+    assert!(normal_stdout.contains("main"));
+    assert_eq!(bare_stdout.lines().count(), normal_stdout.lines().count());
+}
+
+#[test]
+fn test_bare_repo_commands_from_bare_directory() {
+    let test = BareRepoTest::new();
+
+    // Create a worktree so the repo has some content
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Run wt list from the bare repo directory itself (not from a worktree)
+    // Should list the worktree even when run from bare repo, not showing bare repo itself
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(test.bare_repo_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The bare repository's own directory is no worktree, so `@` there names the
+/// branch HEAD points at. `wt switch @` lands in that branch's worktree, and
+/// `wt step copy-ignored`, whose destination defaults to `@`, copies nothing
+/// into the bare repository.
+#[test]
+fn test_bare_repo_at_from_bare_directory_names_head_branch() {
+    let test = BareRepoTest::new();
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+    fs::write(main_worktree.join(".gitignore"), "secret\n").unwrap();
+    fs::write(main_worktree.join("secret"), "s\n").unwrap();
+
+    let output = test
+        .wt_command()
+        .args(["switch", "@", "--no-cd", "--yes", "--format=json"])
+        .current_dir(test.bare_repo_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["branch"], "main");
+    assert_eq!(Path::new(json["path"].as_str().unwrap()), main_worktree);
+
+    let output = test
+        .wt_command()
+        .args(["step", "copy-ignored"])
+        .current_dir(test.bare_repo_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!test.bare_repo_path().join("secret").exists());
+}
+
+/// From a bare repo's directory, `wt remove` with no argument means `@`, the
+/// worktree of the branch HEAD names. With HEAD on the default branch, both
+/// spellings refuse the same way, and that worktree stays.
+#[test]
+fn test_bare_repo_remove_from_bare_directory_targets_head_branch() {
+    let test = BareRepoTest::new();
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+    test.create_worktree("feature", "feature");
+
+    let remove = |args: &[&str]| {
+        test.wt_command()
+            .arg("remove")
+            .args(args)
+            .args(["--yes", "--foreground"])
+            .current_dir(test.bare_repo_path())
+            .output()
+            .unwrap()
+    };
+    let no_arg = remove(&[]);
+    let at = remove(&["@"]);
+
+    assert!(!no_arg.status.success());
+    assert_eq!(no_arg.status.code(), at.status.code());
+    assert_eq!(no_arg.stderr, at.stderr);
+    assert!(main_worktree.exists());
+    insta::assert_snapshot!(String::from_utf8_lossy(&no_arg.stderr), @"
+    ✗ Cannot remove the default branch main
+    ");
+}
+
+/// From a bare repo's directory, commands without a selector act on the
+/// worktree of the branch HEAD names, here `feature` rather than the primary
+/// `main`: `wt hook show` lists that worktree's project hooks, and `wt step
+/// squash --show-prompt` previews that worktree's changes.
+#[test]
+fn test_bare_repo_previews_from_bare_directory_use_head_branch() {
+    let test = BareRepoTest::new();
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+    let feature_worktree = test.create_worktree("feature", "feature");
+    test.commit_in(&feature_worktree, "feature-line");
+    test.run_git_in(
+        test.bare_repo_path(),
+        &["symbolic-ref", "HEAD", "refs/heads/feature"],
+    );
+    test.run_git_in(
+        test.bare_repo_path(),
+        &["config", "worktrunk.default-branch", "main"],
+    );
+    for (worktree, hook) in [
+        (&main_worktree, "main-hook"),
+        (&feature_worktree, "feature-hook"),
+    ] {
+        fs::create_dir_all(worktree.join(".config")).unwrap();
+        fs::write(
+            worktree.join(".config/wt.toml"),
+            format!("pre-commit = \"echo {hook}\"\n"),
+        )
+        .unwrap();
+    }
+
+    let run = |args: &[&str]| {
+        let output = test
+            .wt_command()
+            .args(args)
+            .current_dir(test.bare_repo_path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let hooks = run(&["hook", "show", "--format=json"]);
+    assert!(hooks.contains("feature-hook"), "{hooks}");
+    assert!(!hooks.contains("main-hook"), "{hooks}");
+
+    let prompt = run(&["step", "squash", "main", "--show-prompt"]);
+    assert!(prompt.contains("+feature-line"), "{prompt}");
+}
+
+/// Full merge workflow in a bare repo: create main + feature worktrees, merge
+/// feature into main, and confirm the merge landed.
+///
+/// Runs on all platforms. Background worktree cleanup after merge is tolerated
+/// via `wait_for_worktree_removed` — on Windows, file locking can leave an empty
+/// placeholder dir behind, which is production-harmless (see the predicate note
+/// at the call site below).
+#[test]
+fn test_bare_repo_merge_workflow() {
+    let test = BareRepoTest::new();
+
+    // Create main worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit on main");
+
+    // Create feature branch worktree using wt switch
+    // Config uses {{ branch }} template, so worktrees are inside bare repo
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+    cmd.output().unwrap();
+
+    // Get feature worktree path (template: {{ branch }} -> repo/feature)
+    let feature_worktree = test.bare_repo_path().join("feature");
+    assert!(feature_worktree.exists());
+
+    // Make a commit in feature worktree
+    test.commit_in(&feature_worktree, "Feature work");
+
+    // Merge feature into main (explicitly specify target)
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args([
+        "merge",
+        "main",        // Explicitly specify target branch
+        "--no-squash", // Skip squash to avoid LLM dependency
+        "--no-hooks",  // Skip pre-merge hooks
+    ])
+    .current_dir(&feature_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt merge failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Wait for background removal to complete
+    // Use the "gone or empty placeholder" predicate — the instant-removal
+    // path leaves an empty dir behind if the background `rmdir` silently
+    // fails (stray `.DS_Store`, scheduling delay under parallel load).
+    // That placeholder is production-harmless but trips a strict
+    // `!exists()` check.
+    wait_for_worktree_removed(&feature_worktree);
+
+    // Verify main worktree still exists and has the feature commit
+    assert!(main_worktree.exists());
+
+    // Check that feature branch commit is now in main
+    let log_output = test
+        .git_command(&main_worktree)
+        .args(["log", "--oneline"])
+        .run()
+        .unwrap();
+
+    let log = String::from_utf8_lossy(&log_output.stdout);
+    assert!(
+        log.contains("Feature work"),
+        "Main should contain feature commit after merge"
+    );
+}
+
+#[test]
+fn test_bare_repo_background_logs_location() {
+    // This test verifies that background operation logs go to the correct location
+    // in bare repos (bare_repo/wt/logs/ instead of worktree/.git/wt/logs/)
+    let test = BareRepoTest::new();
+
+    // Create main worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Create feature worktree
+    let feature_worktree = test.create_worktree("feature", "feature");
+    test.commit_in(&feature_worktree, "Feature work");
+
+    // Run remove in background to test log file location
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["remove", "feature"]).current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt remove failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Wait for background process to create log file (poll instead of fixed sleep)
+    // The key test is that the path is correct, not that content was written
+    // (background processes are flaky in tests). Logs live at:
+    // `{bare_repo}/wt/logs/{sanitized-branch}/internal/remove.log`
+    let log_dir = test.bare_repo_path().join("wt/logs");
+    let remove_log = log_dir
+        .join(worktrunk::path::sanitize_for_filename("feature"))
+        .join("internal")
+        .join("remove.log");
+    wait_for_file(&remove_log);
+    assert!(
+        remove_log.exists(),
+        "Expected remove log at {}",
+        remove_log.display()
+    );
+
+    // Verify it's NOT in the worktree's .git directory (which doesn't exist for linked worktrees)
+    let wrong_dir = main_worktree.join(".git/wt/logs");
+    assert!(
+        !wrong_dir.exists()
+            || std::fs::read_dir(&wrong_dir)
+                .map(|d| d.count())
+                .unwrap_or(0)
+                == 0,
+        "Log should NOT be in worktree's .git directory"
+    );
+}
+
+#[test]
+fn test_bare_repo_project_config_found_from_bare_root() {
+    // Regression test for #1691: project config in the primary worktree should be
+    // found when running from the bare repo root directory, not just from within
+    // a worktree that contains the config.
+    let test = BareRepoTest::new();
+
+    // Create main worktree (the primary worktree for bare repos)
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Place project config in the primary worktree's .config/wt.toml
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    // Use a marker file to prove the hook ran
+    let marker_path = test.bare_repo_path().join("hook-ran.marker");
+    let marker_str = marker_path.to_str().unwrap().replace('\\', "/");
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo hook-executed > '{}'\"\n", marker_str),
+    )
+    .unwrap();
+
+    // Commit the config so it's part of the worktree
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+
+    // Now run `wt switch --create feature` from the bare repo root (NOT from main worktree)
+    // This is the scenario described in #1691
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature", "--yes"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The hook from the primary worktree's config should have executed
+    wait_for_file_content(&marker_path);
+    let content = fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        content.contains("hook-executed"),
+        "Hook from primary worktree config should run when command is invoked from bare root. \
+         Marker file content: {:?}",
+        content
+    );
+}
+
+#[test]
+fn test_bare_repo_project_config_found_when_primary_on_non_default_branch() {
+    // Regression test for #3461: the project config must still be found from the
+    // bare root when the primary worktree is temporarily checked out to a
+    // *non-default* branch. This is the gap left by #1691's fix —
+    // `project_config_path()` locates the primary worktree via
+    // `primary_worktree()`, which looks it up by "which worktree holds the
+    // default branch". When an agent-driven workflow briefly checks out a PR
+    // branch in the primary worktree, no worktree holds the default branch, so
+    // the project source was dropped silently and NO project hooks fired.
+    //
+    // The fix reads the committed default-branch config from the object store
+    // (`git show <default>:.config/wt.toml`), so this test also pins that it
+    // reads the *default branch's* config, not whatever the parked worktree
+    // happens to have on disk: after parking the primary off-branch, the
+    // working-tree config is overwritten with a divergent hook that must NOT
+    // run.
+    let test = BareRepoTest::new();
+
+    // Create main worktree (the primary worktree for bare repos)
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Place project config in the primary worktree's .config/wt.toml
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    // Marker written by the default branch's committed hook (the one that
+    // must run), plus a marker for a divergent on-disk hook that must not.
+    let marker_path = test.bare_repo_path().join("hook-ran-off-branch.marker");
+    let marker_str = marker_path.to_str().unwrap().replace('\\', "/");
+    let stale_marker_path = test.bare_repo_path().join("hook-ran-stale.marker");
+    let stale_marker_str = stale_marker_path.to_str().unwrap().replace('\\', "/");
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo hook-executed > '{}'\"\n", marker_str),
+    )
+    .unwrap();
+
+    // Commit the config so it's part of the worktree
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+
+    // Move the primary worktree off the default branch, so no worktree holds
+    // `main`. This is the exact state that triggers the regression.
+    let output = test
+        .git_command(&main_worktree)
+        .args(["checkout", "-b", "feature-x"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "checkout -b feature-x failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Overwrite the parked worktree's on-disk config with a divergent hook,
+    // uncommitted. If resolution read the parked worktree's files instead of
+    // the default branch's committed tree, this stale hook would run.
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo stale > '{}'\"\n", stale_marker_str),
+    )
+    .unwrap();
+
+    // Now run `wt switch --create test-repro` from the bare repo root.
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "test-repro", "--yes"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The default branch's committed hook must run even though the primary
+    // worktree is parked on a non-default branch.
+    wait_for_file_content(&marker_path);
+    let content = fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        content.contains("hook-executed"),
+        "Project hook must run from the bare root even when the primary worktree \
+         is on a non-default branch (#3461). Marker file content: {:?}",
+        content
+    );
+
+    // The parked worktree's divergent on-disk hook must NOT run — resolution
+    // reads the default branch's committed config, not the checked-out files.
+    assert!(
+        !stale_marker_path.exists(),
+        "Resolution must read the default branch's committed config via `git \
+         show`, not the parked worktree's on-disk file"
+    );
+}
+
+#[test]
+fn test_bare_repo_no_project_config_when_primary_off_branch_and_none_present() {
+    // Companion to the #3461 fix: the object-store fallback that reads
+    // `git show <default>:.config/wt.toml` when the default branch is checked
+    // out nowhere must not conjure a config that doesn't exist. With the primary
+    // off the default branch and no config committed on the default branch,
+    // `git show` exits non-zero and resolution stays `None` — the command
+    // succeeds and no project hook runs.
+    let test = BareRepoTest::new();
+
+    // Create main worktree (the primary worktree for bare repos) — no config
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Move the primary worktree off the default branch.
+    let output = test
+        .git_command(&main_worktree)
+        .args(["checkout", "-b", "feature-x"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "checkout -b feature-x failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run `wt switch --create foo` from the bare repo root. With no project
+    // config anywhere, it should still succeed.
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "foo", "--yes"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt switch should succeed with no project config:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // No config exists, so no worktree should be reported as carrying one and
+    // no project hook can run. `wt config show` from the bare root confirms the
+    // fallback found nothing rather than resolving a phantom config.
+    let mut show = test.wt_command();
+    show.args(["config", "show", "--format=json"])
+        .current_dir(test.bare_repo_path());
+    let show_out = show.output().unwrap();
+    assert!(
+        show_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&show_out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&show_out.stdout)).unwrap();
+    assert!(
+        json["project"]["config"].is_null(),
+        "no project config should be resolved when none exists, got: {}",
+        json["project"]["config"]
+    );
+}
+
+#[test]
+fn test_bare_repo_committed_config_does_not_supersede_override() {
+    // Companion to the #3461 fix: the object-store fallback must never
+    // supersede an explicit `WORKTRUNK_PROJECT_CONFIG_PATH`. The override
+    // names the config source outright — a missing file there means no
+    // project config — and it exists for test isolation, where reading the
+    // repo's own committed config is exactly the leak being prevented.
+    let test = BareRepoTest::new();
+
+    // Commit a project config on the default branch, then park the primary
+    // worktree off it — the state where the committed fallback applies.
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "pre-start = \"echo committed\"\n",
+    )
+    .unwrap();
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+    let output = test
+        .git_command(&main_worktree)
+        .args(["checkout", "-b", "feature-x"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "checkout -b feature-x failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut cmd = test.wt_command();
+    cmd.env(
+        "WORKTRUNK_PROJECT_CONFIG_PATH",
+        test.temp_path().join("nonexistent.toml"),
+    );
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(test.bare_repo_path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(
+        json["project"]["config"].is_null(),
+        "an override pointing at a missing file must not fall back to the committed config, got: {}",
+        json["project"]["config"]
+    );
+}
+
+#[test]
+fn test_bare_repo_project_config_found_from_linked_worktree_when_primary_off_branch() {
+    // Regression for the #3461 fix: the object-store fallback must resolve the
+    // *default branch's* config by name, not via `HEAD`. `git show HEAD:...`
+    // resolves HEAD against the invocation cwd's per-worktree HEAD, so when `wt`
+    // runs from inside a linked worktree parked on another branch — the common
+    // agent case — HEAD is that worktree's branch, not the default. Reading
+    // HEAD there dropped the default branch's config and every project hook.
+    //
+    // This test runs `wt switch --create` from inside a *second* linked worktree
+    // whose branch has no `.config/wt.toml` on disk, with the default branch
+    // checked out nowhere, and asserts the default branch's committed hook still
+    // fires. `git show HEAD:...` would read the invoking worktree's branch
+    // (no config) and silently drop the hook; `git show <default>:...` finds it.
+    let test = BareRepoTest::new();
+
+    // Primary worktree on the default branch, carrying the project config.
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let marker_path = test.bare_repo_path().join("hook-ran-from-linked.marker");
+    let marker_str = marker_path.to_str().unwrap().replace('\\', "/");
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo hook-executed > '{}'\"\n", marker_str),
+    )
+    .unwrap();
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+
+    // A second linked worktree whose branch drops the config on disk, so
+    // resolution there must fall through to the object-store read.
+    let other_worktree = test.create_worktree("other", "other");
+    let output = test
+        .git_command(&other_worktree)
+        .args(["rm", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rm failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    test.commit_in(&other_worktree, "Remove project config on other branch");
+
+    // Park the primary off the default branch, so `main` is checked out nowhere.
+    let output = test
+        .git_command(&main_worktree)
+        .args(["checkout", "-b", "feature-x"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "checkout -b feature-x failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run `wt switch --create` from *inside* the `other` worktree (HEAD = other).
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "test-repro", "--yes"])
+        .current_dir(&other_worktree);
+
+    let output = cmd.output().unwrap();
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The default branch's committed hook must run even though `wt` was invoked
+    // from a linked worktree whose own branch carries no config.
+    wait_for_file_content(&marker_path);
+    let content = fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        content.contains("hook-executed"),
+        "Project hook must resolve the default branch's config by name (not via \
+         cwd `HEAD`) when invoked from a linked worktree. Marker content: {:?}",
+        content
+    );
+}
+
+#[test]
+fn test_bare_repo_config_show_reflects_object_store_fallback() {
+    // Regression for #3476: `wt config show` must display the config that
+    // `load_project_config` actually resolves. In the #3461 state — a bare repo
+    // whose default branch (carrying `.config/wt.toml`) is checked out in no
+    // worktree — the config comes from the object store, but `config show`
+    // previously keyed off `project_config_path()` alone and reported the
+    // config as absent (`Not found` / `exists: false`) while its hooks run.
+    let test = BareRepoTest::new();
+
+    // Primary worktree on the default branch, carrying the project config.
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("wt.toml"), "post-start = \"echo hi\"\n").unwrap();
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+
+    // A second linked worktree whose branch drops the config on disk, so
+    // resolution from inside it must fall through to the object-store read.
+    let other_worktree = test.create_worktree("other", "other");
+    let output = test
+        .git_command(&other_worktree)
+        .args(["rm", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rm failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    test.commit_in(&other_worktree, "Remove project config on other branch");
+
+    // Park the primary off the default branch, so `main` is checked out nowhere.
+    let output = test
+        .git_command(&main_worktree)
+        .args(["checkout", "-b", "feature-x"])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "checkout -b feature-x failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // JSON: `path`/`exists`/`config` must agree with the object-store source.
+    let mut cmd = test.wt_command();
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(&other_worktree);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(
+        json["project"]["config"]["post-start"], "echo hi",
+        "config show must surface the object-store config that hooks run from, got: {}",
+        json["project"]
+    );
+    assert_eq!(
+        json["project"]["exists"], true,
+        "`exists` must be true when config resolved from the object store, got: {}",
+        json["project"]
+    );
+    assert_eq!(
+        json["project"]["path"], "main:.config/wt.toml",
+        "`path` must name the object-store revision spec, not a missing file, got: {}",
+        json["project"]
+    );
+
+    // Text: the object-store source is labeled and the config is dumped —
+    // never `Not found`.
+    let mut cmd = test.wt_command();
+    cmd.args(["config", "show"]).current_dir(&other_worktree);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("from object store") && stdout.contains("post-start"),
+        "config show text must label the object-store source and dump the config; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Not found"),
+        "config show must not report the object-store config as `Not found`; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_bare_repo_config_show_reads_dash_prefixed_default_branch() {
+    let test = BareRepoTest::new();
+
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("wt.toml"),
+        "[list]\nurl = \"http://localhost:3000\"\n",
+    )
+    .unwrap();
+    test.run_git_in(&main_worktree, &["add", ".config/wt.toml"]);
+    test.run_git_in(&main_worktree, &["commit", "-m", "Add project config"]);
+
+    test.run_git_in(
+        test.bare_repo_path(),
+        &["update-ref", "refs/heads/-x", "refs/heads/main"],
+    );
+    test.run_git_in(
+        test.bare_repo_path(),
+        &["config", "worktrunk.default-branch", "-x"],
+    );
+
+    let mut cmd = test.wt_command();
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(test.bare_repo_path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(
+        json["project"]["config"]["list"]["url"], "http://localhost:3000",
+        "config show must read the committed config when the default branch starts with a dash, got: {}",
+        json["project"]
+    );
+}
+
+#[test]
+fn test_bare_repo_project_config_found_with_dash_c_flag() {
+    // Regression test for #1691 (comment): project config in the primary worktree
+    // should be found when using `-C <repo>` from an unrelated directory.
+    let test = BareRepoTest::new();
+
+    // Create main worktree (the primary worktree for bare repos)
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Place project config in the primary worktree's .config/wt.toml
+    let config_dir = main_worktree.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    // Use a marker file to prove the hook ran
+    let marker_path = test.bare_repo_path().join("hook-ran-c-flag.marker");
+    let marker_str = marker_path.to_str().unwrap().replace('\\', "/");
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo hook-executed > '{}'\"\n", marker_str),
+    )
+    .unwrap();
+
+    // Commit the config so it's part of the worktree
+    let output = test
+        .git_command(&main_worktree)
+        .args(["add", ".config/wt.toml"])
+        .run()
+        .unwrap();
+    assert!(output.status.success());
+    test.commit_in(&main_worktree, "Add project config");
+
+    // Run from a completely unrelated directory using -C to point at the bare repo
+    let unrelated_dir = tempfile::tempdir().unwrap();
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args([
+        "-C",
+        test.bare_repo_path().to_str().unwrap(),
+        "switch",
+        "--create",
+        "feature-c-flag",
+        "--yes",
+    ])
+    .current_dir(unrelated_dir.path());
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch -C failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The hook from the primary worktree's config should have executed
+    wait_for_file_content(&marker_path);
+    let content = fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        content.contains("hook-executed"),
+        "Hook from primary worktree config should run when using -C flag. \
+         Marker file content: {:?}",
+        content
+    );
+}
+
+#[test]
+fn test_bare_repo_ignores_config_in_bare_root() {
+    // Regression test for #1691: a `.config/wt.toml` placed in the bare repo root
+    // directory should NOT be picked up. Only the primary worktree's config matters.
+    let test = BareRepoTest::new();
+
+    // Create main worktree (the primary worktree for bare repos) — no config here
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Place config in the bare repo root (NOT in a worktree)
+    let config_dir = test.bare_repo_path().join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let marker_path = test.bare_repo_path().join("hook-should-not-run.marker");
+    let marker_str = marker_path.to_str().unwrap().replace('\\', "/");
+    fs::write(
+        config_dir.join("wt.toml"),
+        format!("post-start = \"echo bad > '{}'\"\n", marker_str),
+    )
+    .unwrap();
+
+    // Run `wt switch --create feature` from the bare repo root
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature", "--yes"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt switch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The hook from the bare root config should NOT have executed
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+    assert!(
+        !marker_path.exists(),
+        "Config in bare repo root should be ignored — only primary worktree config should be used"
+    );
+}
+
+#[test]
+fn test_bare_repo_slashed_branch_with_sanitize() {
+    // Test that slashed branch names work with bare repos and the sanitize filter
+    // This matches the documented workflow in tips-patterns.md
+    let test = BareRepoTest::new();
+
+    // Override config to use sanitize filter (matches documented config)
+    fs::write(
+        test.config_path(),
+        "worktree-path = \"{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    // Create main worktree
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit");
+
+    // Create feature branch with slash using wt switch
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature/auth"])
+        .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify worktree was created with sanitized name (feature-auth, not feature/auth)
+    let expected_path = test.bare_repo_path().join("feature-auth");
+    assert!(
+        expected_path.exists(),
+        "Expected worktree at {:?} (sanitized from feature/auth)",
+        expected_path
+    );
+
+    // Verify slashed path was NOT created
+    let wrong_path = test.bare_repo_path().join("feature/auth");
+    assert!(
+        !wrong_path.exists(),
+        "Should not create nested directory for slashed branch"
+    );
+
+    // Verify git branch name is preserved (not sanitized)
+    let branch_output = test
+        .git_command(&expected_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .run()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&branch_output.stdout).trim(),
+        "feature/auth",
+        "Git branch name should be preserved as feature/auth"
+    );
+}
+
+/// Helper to create a nested bare repository test setup (project/.git pattern)
+///
+/// This tests the pattern from GitHub issue #313 where users clone with:
+/// `git clone --bare <url> project/.git`
+///
+/// Composes over [`TestRepo::bare_at`], which owns the repo plumbing
+/// (canonicalized root, isolated config paths, `LOCAL_TEST_CONFIG`); this
+/// struct owns the project directory the bare repo nests in, plus the
+/// sibling-worktree template (`../{{ branch }}`).
+struct NestedBareRepoTest {
+    /// Owns project/; must outlive `repo`, whose path lives inside it.
+    temp_dir: tempfile::TempDir,
+    /// Path to the parent directory (project/)
+    project_path: PathBuf,
+    /// Config lives in `temp_dir`, not in `repo`'s internal config dir:
+    /// snapshots print this path, and their filters cover `temp_path()`.
+    test_config_path: PathBuf,
+    repo: TestRepo,
+}
+
+impl NestedBareRepoTest {
+    fn new() -> Self {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // Create project directory with the bare repo inside as .git
+        let project_path = temp_dir.path().join("project");
+        let repo = TestRepo::bare_at(&project_path.join(".git"));
+        let project_path = canonicalize(&project_path).unwrap();
+
+        // Worktrees as siblings to .git: project/main, project/feature
+        let test_config_path = temp_dir.path().join("test-config.toml");
+        fs::write(&test_config_path, "worktree-path = \"../{{ branch }}\"\n").unwrap();
+
+        Self {
+            temp_dir,
+            project_path,
+            test_config_path,
+            repo,
+        }
+    }
+
+    fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
+    fn bare_repo_path(&self) -> &Path {
+        self.repo.path()
+    }
+
+    fn config_path(&self) -> &Path {
+        &self.test_config_path
+    }
+
+    fn temp_path(&self) -> &Path {
+        self.temp_dir.path()
+    }
+
+    /// Configure a wt command with test environment
+    fn configure_wt_cmd(&self, cmd: &mut Command) {
+        self.configure_git_cmd(cmd);
+        cmd.env("WORKTRUNK_CONFIG_PATH", &self.test_config_path)
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR_FORCE");
+    }
+
+    /// This fixture's environment for a PTY-spawned wt subprocess, built from
+    /// the same layers as `TestRepo::test_env_vars`.
+    #[cfg(all(unix, feature = "shell-integration-tests"))]
+    fn test_env_vars(&self) -> Vec<(String, String)> {
+        use crate::common::{TestEnvPaths, pty_env_vars};
+
+        // HOME and XDG_CONFIG_HOME are needed for config lookups in env_clear'd PTY
+        let home = self.temp_dir.path().join("home");
+        std::fs::create_dir_all(&home).ok();
+
+        pty_env_vars(TestEnvPaths {
+            home: &home,
+            wt_config: &self.test_config_path,
+            approvals: &self.temp_dir.path().join("test-approvals.toml"),
+        })
+    }
+}
+
+impl TestRepoBase for NestedBareRepoTest {}
+
+/// instead of project/.git/ (GitHub issue #313)
+#[test]
+fn test_nested_bare_repo_worktree_path() {
+    let test = NestedBareRepoTest::new();
+
+    // Create first worktree using wt switch --create
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "main"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch --create main failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // CRITICAL: Worktree should be at project/main, NOT project/.git/main
+    let expected_path = test.project_path().join("main");
+    let wrong_path = test.bare_repo_path().join("main");
+
+    assert!(
+        expected_path.exists(),
+        "Expected worktree at {:?} (sibling to .git)",
+        expected_path
+    );
+    assert!(
+        !wrong_path.exists(),
+        "Worktree should NOT be inside .git directory at {:?}",
+        wrong_path
+    );
+}
+
+#[test]
+fn test_nested_bare_repo_full_workflow() {
+    let test = NestedBareRepoTest::new();
+
+    // Create main worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "main"])
+        .current_dir(test.bare_repo_path());
+    cmd.output().unwrap();
+
+    let main_worktree = test.project_path().join("main");
+    assert!(main_worktree.exists());
+    test.commit_in(&main_worktree, "Initial");
+
+    // Create feature worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+    cmd.output().unwrap();
+
+    // Feature worktree should be at project/feature
+    let feature_worktree = test.project_path().join("feature");
+    assert!(
+        feature_worktree.exists(),
+        "Feature worktree should be at project/feature"
+    );
+
+    // List should show both worktrees
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    cmd.arg("list").current_dir(&main_worktree);
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("main"), "Should list main worktree");
+    assert!(stdout.contains("feature"), "Should list feature worktree");
+
+    // Remove feature worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["remove", "feature", "--foreground"])
+        .current_dir(&main_worktree);
+    cmd.output().unwrap();
+
+    assert!(
+        !feature_worktree.exists(),
+        "Feature worktree should be removed"
+    );
+    assert!(main_worktree.exists());
+}
+
+#[test]
+fn test_nested_bare_repo_list_snapshot() {
+    let test = NestedBareRepoTest::new();
+
+    // Create main worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "main"])
+        .current_dir(test.bare_repo_path());
+    cmd.output().unwrap();
+
+    let main_worktree = test.project_path().join("main");
+    test.commit_in(&main_worktree, "Initial");
+
+    // Create feature worktree
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+    cmd.output().unwrap();
+
+    // Take snapshot of list output
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(&main_worktree);
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+#[test]
+fn test_bare_repo_bootstrap_first_worktree() {
+    // Test that we can create the first worktree in a bare repo using wt switch --create
+    // without needing to manually run `git worktree add` first.
+    // This tests that load_project_config() returns None for bare repos without worktrees,
+    // allowing the bootstrap workflow to proceed.
+    let test = BareRepoTest::new();
+
+    // Unlike other tests, we do NOT create any worktrees first.
+    // We run wt switch --create directly on the bare repo.
+
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "main"])
+        .current_dir(test.bare_repo_path());
+
+    let output = cmd.output().unwrap();
+
+    if !output.status.success() {
+        panic!(
+            "wt switch --create main from bare repo with no worktrees failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Verify the worktree was created inside the bare repo
+    // Template: {{ branch }} -> repo/main
+    let expected_path = test.bare_repo_path().join("main");
+    assert!(
+        expected_path.exists(),
+        "Expected first worktree at {:?}",
+        expected_path
+    );
+
+    // Verify git worktree list shows the new worktree
+    let output = test
+        .git_command(test.bare_repo_path())
+        .args(["worktree", "list"])
+        .run()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should show 2 entries: bare repo + main worktree
+    assert_eq!(
+        stdout.lines().count(),
+        2,
+        "Should have bare repo + 1 worktree"
+    );
+    assert!(stdout.contains("main"), "Should list main worktree");
+}
+
+/// Regression test: `wt list` from a `git clone --bare` repo must not run
+/// `git status` on the bare entry. Before the fix, this produced:
+///   "fatal: this operation must be run in a work tree"
+///
+/// Uses `git clone --bare` (real-world pattern) rather than `git init --bare`
+/// (used by BareRepoTest) to cover the exact reported scenario.
+#[test]
+fn test_clone_bare_repo_list_no_status_errors() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let test_config_path = temp_dir.path().join("test-config.toml");
+    fs::write(&test_config_path, "").unwrap();
+
+    let run_git = |dir: &Path, args: &[&str]| {
+        let output = configure_git_env(Cmd::new("git"))
+            .args(args.iter().copied())
+            .current_dir(dir)
+            .run()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Create a source repo with a commit (clone --bare needs history)
+    let source = temp_dir.path().join("source");
+    run_git(
+        temp_dir.path(),
+        &["init", "--initial-branch", "main", source.to_str().unwrap()],
+    );
+    fs::write(source.join("file.txt"), "content").unwrap();
+    run_git(&source, &["add", "file.txt"]);
+    run_git(&source, &["commit", "-m", "Initial commit"]);
+
+    // Clone as bare — the exact pattern from the bug report
+    let bare_path = temp_dir.path().join("project.bare");
+    run_git(
+        temp_dir.path(),
+        &[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            bare_path.to_str().unwrap(),
+        ],
+    );
+
+    // Create linked worktrees (outside the bare dir, matching real usage)
+    let main_wt = temp_dir.path().join("main");
+    let feature_wt = temp_dir.path().join("feature");
+    run_git(
+        &bare_path,
+        &["worktree", "add", main_wt.to_str().unwrap(), "main"],
+    );
+    run_git(&bare_path, &["branch", "feature", "main"]);
+    run_git(
+        &bare_path,
+        &["worktree", "add", feature_wt.to_str().unwrap(), "feature"],
+    );
+
+    // Run wt list from the bare repo directory (the reported scenario)
+    let mut cmd = wt_command();
+    configure_git_cmd(&mut cmd);
+    cmd.env("WORKTRUNK_CONFIG_PATH", &test_config_path)
+        .arg("list")
+        .current_dir(&bare_path);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt list should succeed.\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("must be run in a work tree"),
+        "Should not get 'must be run in a work tree' error.\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("task failed") && !stderr.contains("tasks failed"),
+        "Should not have task failures.\nstderr: {stderr}"
+    );
+}
+
+/// Regression test for #1618: `wt merge` must not remove the default branch
+/// worktree in a bare repo. In bare repos all worktrees are linked, so the
+/// `is_linked()` check alone can't protect the primary worktree.
+#[test]
+fn test_bare_repo_merge_preserves_default_branch_worktree() {
+    let test = BareRepoTest::new();
+
+    // Create main (default branch) worktree and a feature worktree at the same commit
+    let main_worktree = test.create_worktree("main", "main");
+    test.commit_in(&main_worktree, "Initial commit on main");
+
+    // Create feature branch at the same commit as main
+    let _feature_worktree = test.create_worktree("feature", "feature");
+
+    // Run `wt merge feature` from the main (default branch) worktree.
+    // This attempts to merge main into feature — the important thing is that
+    // the main worktree must NOT be removed even though is_linked() returns true.
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args([
+        "merge",
+        "feature",     // Target = feature branch
+        "--no-squash", // Skip squash to avoid LLM dependency
+        "--no-hooks",  // Skip hooks
+    ])
+    .current_dir(&main_worktree);
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The merge itself may succeed or show "already up to date", but the key
+    // assertion is that the main worktree is preserved (not removed).
+    assert!(
+        main_worktree.exists(),
+        "Default branch worktree must not be removed.\nstderr: {stderr}"
+    );
+
+    // Should show "primary worktree" preservation message
+    assert!(
+        stderr.contains("primary worktree"),
+        "Should show primary worktree preservation message.\nstderr: {stderr}"
+    );
+}
+
+/// Helper: create a NestedBareRepoTest with no worktree-path configured and a main worktree.
+///
+/// Reuses NestedBareRepoTest's bare repo setup but clears the worktree-path config,
+/// so the default template (which references `{{ repo }}`) triggers the bare repo prompt.
+fn setup_unconfigured_nested_bare_repo() -> NestedBareRepoTest {
+    let test = NestedBareRepoTest::new();
+
+    // Temporarily set worktree-path so the main worktree lands at project/main
+    // (without this, the default {{ repo }} template produces .git.main).
+    fs::write(
+        test.config_path(),
+        "worktree-path = \"../{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    // Create main worktree with a commit (needed as a starting point for switch)
+    let (cd_path, _guard) = directive_file();
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["switch", "--create", "main", "--yes"])
+        .current_dir(test.bare_repo_path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Failed to create main worktree:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Clear config so the default template applies — the test subject is the bare repo prompt.
+    // Skip shell integration prompt so it doesn't interfere (especially in PTY tests).
+    fs::write(test.config_path(), "skip-shell-integration-prompt = true\n").unwrap();
+
+    test
+}
+
+/// Test that --yes does NOT auto-accept the bare repo config change — it shows
+/// the warning and creates the worktree at the unconfigured (bad) path.
+#[test]
+fn test_bare_repo_worktree_path_prompt_auto_accept() {
+    let test = setup_unconfigured_nested_bare_repo();
+    let main_worktree = test.project_path().join("main");
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let (cd_path, _guard) = directive_file();
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        configure_directive_file(&mut cmd, &cd_path);
+        cmd.args(["switch", "--create", "feature", "--yes"])
+            .current_dir(&main_worktree);
+
+        assert_cmd_snapshot!(cmd);
+    });
+
+    // Config should NOT have worktree-path — --yes skips the config prompt
+    let config_content = fs::read_to_string(test.config_path()).unwrap();
+    assert!(
+        !config_content.contains("worktree-path"),
+        "Config should NOT contain worktree-path — --yes should not auto-configure.\nConfig: {config_content}"
+    );
+
+    // Worktree created at the unconfigured path (bad but expected without config)
+    let bad_path = test.project_path().join(".git.feature");
+    assert!(
+        bad_path.exists(),
+        "Worktree should be at {:?} (unconfigured default path)",
+        bad_path
+    );
+}
+
+/// Test that non-interactive (piped stdin) shows warning instead of prompt.
+#[test]
+fn test_bare_repo_worktree_path_prompt_non_interactive_warning() {
+    let test = setup_unconfigured_nested_bare_repo();
+    let main_worktree = test.project_path().join("main");
+
+    let settings = setup_temp_snapshot_settings(test.temp_path());
+    settings.bind(|| {
+        let (cd_path, _guard) = directive_file();
+        let mut cmd = wt_command();
+        test.configure_wt_cmd(&mut cmd);
+        configure_directive_file(&mut cmd, &cd_path);
+        // No --yes, but stdin is piped (non-interactive) since assert_cmd_snapshot
+        // doesn't attach a TTY
+        cmd.args(["switch", "--create", "feature"])
+            .current_dir(&main_worktree);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The warning names where the configured template puts the worktree, not
+/// the default template's `{{ repo }}.{{ branch }}` shape.
+#[test]
+fn test_bare_repo_worktree_path_warning_uses_configured_template() {
+    let test = setup_unconfigured_nested_bare_repo();
+    let main_worktree = test.project_path().join("main");
+    fs::write(
+        test.config_path(),
+        "skip-shell-integration-prompt = true\nworktree-path = \"{{ repo_path }}/../{{ repo }}-wt/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    cmd.args(["switch", "--create", "feature", "--no-cd"])
+        .current_dir(&main_worktree);
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    assert!(
+        stderr.contains("worktrees will be at project/.git-wt/feature"),
+        "warning should name the configured path, got: {stderr}"
+    );
+    assert!(
+        test.project_path().join(".git-wt").join("feature").exists(),
+        "worktree should be where the warning said"
+    );
+}
+
+/// A shortcut resolves before the bare-repo warning, so its example path names
+/// the branch the shortcut stands for rather than the raw symbol.
+#[test]
+fn test_bare_repo_worktree_path_warning_names_resolved_shortcut() {
+    let test = setup_unconfigured_nested_bare_repo();
+    let main_worktree = test.project_path().join("main");
+
+    // `@` is the current worktree, on `main`.
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    cmd.args(["switch", "@"]).current_dir(&main_worktree);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("worktrees will be at") && stderr.contains(".git.main"),
+        "Warning should name the resolved branch `main`, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".git.@"),
+        "Warning should not name the raw `@`, got: {stderr}"
+    );
+}
+
+/// Once the opt-out is recorded (the `skip-bare-repo-prompt` hint is set), the
+/// bare-repo warning/prompt is suppressed on later switches — the read path
+/// early-returns via `has_shown_hint`.
+#[test]
+fn test_bare_repo_prompt_suppressed_when_opted_out() {
+    let test = setup_unconfigured_nested_bare_repo();
+    let main_worktree = test.project_path().join("main");
+
+    // Record the opt-out the way a decline does: `worktrunk.hints.<name> = <count>`.
+    test.run_git_in(
+        &main_worktree,
+        &["config", "worktrunk.hints.skip-bare-repo-prompt", "1"],
+    );
+
+    let mut cmd = wt_command();
+    test.configure_wt_cmd(&mut cmd);
+    cmd.args(["switch", "--create", "feature"])
+        .current_dir(&main_worktree);
+    let stderr = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
+    assert!(
+        !stderr.contains("Bare repo at"),
+        "Opted-out repo should not re-show the bare-repo warning.\nstderr: {stderr}"
+    );
+}
+
+// =============================================================================
+// PTY-based interactive prompt tests
+// =============================================================================
+
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+mod bare_repo_prompt_pty {
+    use super::*;
+    use crate::common::pty::{build_pty_command, exec_cmd_in_pty_prompted};
+    use crate::common::{add_pty_binary_path_filters, add_pty_filters, wt_bin};
+    use insta::assert_snapshot;
+
+    fn prompt_pty_settings(temp_path: &Path) -> insta::Settings {
+        let mut settings = setup_temp_snapshot_settings(temp_path);
+        add_pty_filters(&mut settings);
+        add_pty_binary_path_filters(&mut settings);
+        settings
+    }
+
+    #[test]
+    fn test_bare_repo_worktree_path_prompt_accept_pty() {
+        let test = setup_unconfigured_nested_bare_repo();
+        let main_worktree = test.project_path().join("main");
+        let env_vars = test.test_env_vars();
+
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["switch", "--create", "feature"],
+            &main_worktree,
+            &env_vars,
+            None,
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["y\n"], "[y/N");
+
+        assert_eq!(exit_code, 0);
+        prompt_pty_settings(test.temp_path()).bind(|| {
+            assert_snapshot!("bare_repo_prompt_accept", &output);
+        });
+
+        // Verify config was written
+        let config_content = fs::read_to_string(test.config_path()).unwrap();
+        assert!(
+            config_content.contains("worktree-path"),
+            "Config should contain worktree-path override.\nConfig: {config_content}"
+        );
+    }
+
+    #[test]
+    fn test_bare_repo_worktree_path_prompt_decline_pty() {
+        let test = setup_unconfigured_nested_bare_repo();
+        let main_worktree = test.project_path().join("main");
+        let env_vars = test.test_env_vars();
+
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["switch", "--create", "feature"],
+            &main_worktree,
+            &env_vars,
+            None,
+        );
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["n\n"], "[y/N");
+
+        assert_eq!(exit_code, 0);
+        prompt_pty_settings(test.temp_path()).bind(|| {
+            assert_snapshot!("bare_repo_prompt_decline", &output);
+        });
+
+        // Declining records the opt-out as a hint (count 1), not under the legacy
+        // top-level key — so it participates in `wt config state`.
+        let hint_value = configure_git_env(Cmd::new("git"))
+            .args(["config", "worktrunk.hints.skip-bare-repo-prompt"])
+            .current_dir(&main_worktree)
+            .run()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&hint_value.stdout).trim(),
+            "1",
+            "Declining should record the opt-out as a hint"
+        );
+
+        // The legacy top-level key must not be written anymore.
+        let legacy_key = configure_git_env(Cmd::new("git"))
+            .args(["config", "worktrunk.skip-bare-repo-prompt"])
+            .current_dir(&main_worktree)
+            .run()
+            .unwrap();
+        assert!(
+            !legacy_key.status.success(),
+            "Legacy top-level skip key should no longer be written"
+        );
+
+        // Round-trip through `wt config state`: the opt-out is listed by the
+        // cache view and removed by the aggregate `state clear`.
+        let mut hints_cmd = wt_command();
+        test.configure_wt_cmd(&mut hints_cmd);
+        hints_cmd
+            .args(["config", "state", "cache"])
+            .current_dir(&main_worktree);
+        let hints_listed = String::from_utf8(hints_cmd.output().unwrap().stdout).unwrap();
+        assert!(
+            hints_listed.contains("skip-bare-repo-prompt"),
+            "state cache should list the opt-out hint.\nstdout: {hints_listed}"
+        );
+
+        // `state clear` removes everything but prompts first — `--yes` skips it.
+        let mut clear_cmd = wt_command();
+        test.configure_wt_cmd(&mut clear_cmd);
+        clear_cmd
+            .args(["config", "state", "clear", "--yes"])
+            .current_dir(&main_worktree);
+        assert!(
+            clear_cmd.output().unwrap().status.success(),
+            "state clear should succeed"
+        );
+
+        let mut hints_after = wt_command();
+        test.configure_wt_cmd(&mut hints_after);
+        hints_after
+            .args(["config", "state", "hints"])
+            .current_dir(&main_worktree);
+        let hints_remaining = String::from_utf8(hints_after.output().unwrap().stdout).unwrap();
+        assert!(
+            !hints_remaining.contains("skip-bare-repo-prompt"),
+            "state clear should remove the opt-out hint.\nstdout: {hints_remaining}"
+        );
+    }
+
+    #[test]
+    fn test_bare_repo_worktree_path_prompt_preview_pty() {
+        let test = setup_unconfigured_nested_bare_repo();
+        let main_worktree = test.project_path().join("main");
+        let env_vars = test.test_env_vars();
+
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["switch", "--create", "feature"],
+            &main_worktree,
+            &env_vars,
+            None,
+        );
+        // Send ? first to see preview, then n to decline
+        let (output, exit_code) = exec_cmd_in_pty_prompted(cmd, &["?\n", "n\n"], "[y/N");
+
+        assert_eq!(exit_code, 0);
+        prompt_pty_settings(test.temp_path()).bind(|| {
+            assert_snapshot!("bare_repo_prompt_preview", &output);
+        });
+    }
+}

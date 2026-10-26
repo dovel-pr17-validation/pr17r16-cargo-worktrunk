@@ -1,0 +1,5 @@
+---
+source: tests/integration_tests/diagnostic.rs
+expression: normalized
+---
+[2m↳[22m [2mTo report a bug, open an issue ([4mhttps://github.com/max-sixty/worktrunk/issues/new[24m) and attach a secret gist: [4mgh gist create --web [DIAGNOSTIC_PATH][24m[22m

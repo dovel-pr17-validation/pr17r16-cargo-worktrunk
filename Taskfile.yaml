@@ -1,0 +1,495 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  REPO_ROOT:
+    sh: pwd
+  STATIC_DIR: "{{.REPO_ROOT}}/docs/public"
+  ASSETS_DIR: "{{.STATIC_DIR}}/assets"
+
+tasks:
+  # Development
+  coverage:
+    desc: Run tests with coverage report
+    cmd: cargo llvm-cov nextest --html --features shell-integration-tests {{.CLI_ARGS}}
+
+  profile-tests:
+    desc: Run the suite under CPU accounting and report where the time goes
+    # tests/AGENTS.md → Profiling the Suite covers how to read the numbers.
+    cmds:
+      # Build first so the measurement covers the test run alone.
+      - cargo nextest run --no-run --features shell-integration-tests
+      # bash's `time` keyword counts every reaped child. Task's own interpreter
+      # (mvdan/sh) parses `time` but reports user/sys as zero, and /usr/bin/time
+      # is an extra package on minimal Linux; bash is present on every dev and
+      # CI platform (Git Bash on Windows).
+      - bash -c 'time "$@"' bash cargo nextest run --features shell-integration-tests {{.CLI_ARGS}}
+      - echo "per-test timings in target/nextest/default/junit.xml"
+
+  setup-web:
+    desc: Setup Claude Code web environment for development
+    platforms: [linux]
+    cmds:
+      - |
+        set -e
+        export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+        echo "========================================"
+        echo "Claude Code Web - Worktrunk Setup"
+        echo "========================================"
+
+        # Check project root
+        if [ ! -f "Cargo.toml" ] || ! grep -q 'name = "worktrunk"' Cargo.toml; then
+            echo "Error: Must be run from worktrunk project root"
+            exit 1
+        fi
+        echo "Found worktrunk project"
+
+        # Check/install Rust
+        echo ""
+        echo "Checking Rust toolchain..."
+        if ! command -v cargo &> /dev/null; then
+            echo "Cargo not found. Installing Rust..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+        fi
+        echo "Rust version: $(rustc --version | awk '{print $2}')"
+
+        # Install what the `shell-integration-tests` feature drives
+        echo ""
+        echo "Installing shell-integration test dependencies..."
+        if command -v apt-get &> /dev/null; then
+            export DEBIAN_FRONTEND=noninteractive
+            # An `if` rather than an `&&` chain: under `set -e` a chain
+            # ending false takes the whole task down, and this one ends
+            # false both on an unmatched glob and on a `.list` file with
+            # no `[` line.
+            for f in /etc/apt/sources.list.d/*.list; do
+                if [ -f "$f" ] && grep -q '^\[' "$f" 2>/dev/null; then
+                    rm -f "$f"
+                fi
+            done
+            # A missing pwsh joins the condition so one refresh serves both
+            # installs: apt resolves the PowerShell .deb's dependencies from
+            # these lists too.
+            if ! command -v zsh &> /dev/null || ! command -v fish &> /dev/null \
+                || ! command -v jq &> /dev/null || ! command -v lsof &> /dev/null \
+                || ! command -v pwsh &> /dev/null; then
+                apt-get update -qq
+                apt-get install -y -qq zsh fish jq lsof
+            fi
+            # PowerShell isn't in Debian's repos. Install the release .deb
+            # rather than the tarball: pwsh aborts at startup without libicu,
+            # and only the .deb declares that dependency for apt to resolve.
+            if ! command -v pwsh &> /dev/null; then
+                PWSH_VERSION="7.6.8"
+                URL="https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/powershell_${PWSH_VERSION}-1.deb_amd64.deb"
+                TEMP=$(mktemp -d)
+                curl -fsSL -o "$TEMP/powershell.deb" "$URL"
+                apt-get install -y -qq "$TEMP/powershell.deb"
+                rm -rf "$TEMP"
+                echo "pwsh installed"
+            fi
+        fi
+
+        # Nushell isn't in every web image, and the shell-integration suite
+        # drives it directly.
+        if ! command -v nu &> /dev/null; then
+            NU_VERSION="0.116.1"
+            DIR="nu-${NU_VERSION}-x86_64-unknown-linux-gnu"
+            TEMP=$(mktemp -d)
+            curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/${DIR}.tar.gz" \
+                | tar -xz -C "$TEMP"
+            install -D -m 0755 "$TEMP/$DIR/nu" "$HOME/.local/bin/nu"
+            rm -rf "$TEMP"
+            echo "nu installed"
+        fi
+        # The shells the feature drives, plus the `jq` its Claude-hook tests
+        # pipe the hook payload through. Run each rather than looking for it
+        # on PATH, because a pwsh missing its libicu is on PATH and aborts at
+        # startup anyway.
+        for tool in bash zsh fish nu pwsh jq; do
+            "$tool" --version > /dev/null 2>&1 || { echo "Error: $tool not usable"; exit 1; }
+            echo "$tool available"
+        done
+
+        # Install gh CLI
+        echo ""
+        echo "Installing GitHub CLI..."
+        if command -v gh &> /dev/null; then
+            echo "gh already installed"
+        else
+            GH_VERSION="2.63.2"
+            ARCH="linux_amd64"
+            URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${ARCH}.tar.gz"
+            mkdir -p ~/bin
+            TEMP=$(mktemp -d)
+            curl -fsSL "$URL" | tar -xz -C "$TEMP"
+            mv "$TEMP/gh_${GH_VERSION}_${ARCH}/bin/gh" ~/bin/gh
+            chmod +x ~/bin/gh
+            rm -rf "$TEMP"
+            export PATH="$HOME/bin:$PATH"
+            echo "gh installed to ~/bin/gh"
+        fi
+
+        # Build
+        echo ""
+        echo "Building worktrunk..."
+        cargo build 2>&1 | tail -5
+        echo "Build successful"
+
+        # Install dev tools
+        echo ""
+        echo "Installing development tools..."
+        if ! command -v uv &> /dev/null; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+        fi
+        uv tool install --force pre-commit
+        cargo install cargo-insta cargo-nextest --quiet
+        install -D -m 0755 target/debug/wt "$HOME/.local/bin/wt"
+        echo "Installed pre-commit, cargo-insta, cargo-nextest, worktrunk"
+
+        echo ""
+        echo "Setup complete! Run 'wt --help' to get started."
+
+  # Assets
+  fetch-assets:
+    desc: Fetch assets from worktrunk-assets repo
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Fetching assets..."
+        rm -rf "{{.ASSETS_DIR}}"
+        mkdir -p "{{.ASSETS_DIR}}"
+        TMPFILE=$(mktemp)
+        curl -fsSL "https://github.com/max-sixty/worktrunk-assets/archive/refs/heads/main.tar.gz" -o "$TMPFILE"
+        tar -xzf "$TMPFILE" --strip-components=2 -C "{{.ASSETS_DIR}}" "worktrunk-assets-main/assets"
+        rm "$TMPFILE"
+        echo "Done. Assets in {{.ASSETS_DIR}}/"
+
+  publish-assets:
+    desc: Publish assets to worktrunk-assets repo
+    dir: "{{.REPO_ROOT}}"
+    cmds:
+      - |
+        set -euo pipefail
+        ASSETS_REPO="../worktrunk-assets"
+        LOCAL_ASSETS="{{.ASSETS_DIR}}"
+
+        # Clone if needed
+        if [[ ! -d "$ASSETS_REPO/.git" ]]; then
+            if ! command -v gh &>/dev/null; then
+                echo "Error: gh CLI required. Install from https://cli.github.com/"
+                exit 1
+            fi
+            echo "Cloning assets repo..."
+            gh repo clone max-sixty/worktrunk-assets "$ASSETS_REPO" || {
+                echo "Failed to clone assets repo"
+                exit 1
+            }
+        fi
+
+        cd "$ASSETS_REPO"
+        git pull --ff-only || {
+            echo "Failed to update assets repo. Check for uncommitted changes."
+            exit 1
+        }
+
+        rsync -av --delete "$LOCAL_ASSETS/" "$ASSETS_REPO/assets/"
+
+        if git diff --quiet; then
+            echo "No changes to publish"
+            exit 0
+        fi
+
+        # Check for deletions - require manual publish if files were removed
+        if git status --porcelain | grep -q '^ D'; then
+            echo "Deletions detected:"
+            git status --porcelain | grep '^ D'
+            echo ""
+            echo "Publish manually in $ASSETS_REPO if this is correct"
+            exit 1
+        fi
+
+        git diff --stat
+        git add -A
+        git commit -m "Update assets"
+        git push
+
+        echo ""
+        echo "Published: https://github.com/max-sixty/worktrunk-assets"
+
+  # Social cards and logo
+  build-social-cards:
+    desc: Build social card PNGs from SVG sources
+    dir: "{{.STATIC_DIR}}"
+    preconditions:
+      - sh: command -v rsvg-convert
+        msg: "rsvg-convert required. Install with: brew install librsvg"
+    cmds:
+      - |
+        set -euo pipefail
+        FONT_DIR="{{.REPO_ROOT}}/.fonts"
+        OUTPUT_DIR="{{.ASSETS_DIR}}/social"
+
+        ensure_font() {
+            local name="$1"
+            local url="$2"
+            if fc-list | grep -qi "$name"; then
+                return 0
+            fi
+            echo "Downloading $name..."
+            mkdir -p "$FONT_DIR"
+            local zip="$FONT_DIR/${name// /_}.zip"
+            curl -fsSL "$url" -o "$zip"
+            unzip -qo "$zip" -d "$FONT_DIR"
+            rm "$zip"
+        }
+
+        ensure_font "Inter" "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip"
+        ensure_font "Plus Jakarta Sans" "https://github.com/tokotype/PlusJakartaSans/releases/download/2.7.1/PlusJakartaSans-2.7.1.zip"
+
+        # Fontconfig setup
+        export FONTCONFIG_FILE="$FONT_DIR/fonts.conf"
+        cat > "$FONT_DIR/fonts.conf" << EOF
+        <?xml version="1.0"?>
+        <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+        <fontconfig>
+          <dir>$FONT_DIR</dir>
+          <cachedir>$FONT_DIR/cache</cachedir>
+          <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+        </fontconfig>
+        EOF
+        mkdir -p "$FONT_DIR/cache"
+        fc-cache -f "$FONT_DIR" 2>/dev/null
+
+        for font in "Inter" "Plus Jakarta Sans"; do
+            if ! fc-list : family | grep -qi "$font"; then
+                echo "Error: Font '$font' not found after download" >&2
+                exit 1
+            fi
+        done
+
+        mkdir -p "$OUTPUT_DIR"
+        echo "Building social cards..."
+        rsvg-convert social-card.svg -o "$OUTPUT_DIR/social-card.png"
+        rsvg-convert github-social-card.svg -o "$OUTPUT_DIR/github-social-card.png"
+        echo "Done:"
+        ls -lh "$OUTPUT_DIR"/*.png
+
+  bench-llm-commits:
+    desc: Benchmark LLM commit message tools (claude, llm, aichat, codex, opencode)
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+
+        # Test prompts
+        SMALL_PROMPT=$(cat <<'EOF'
+        Write a commit message for the staged changes below.
+
+        <format>
+        - Subject under 50 chars, blank line, then optional body
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <diffstat>
+         src/config.rs | 2 ++
+         1 file changed, 2 insertions(+)
+        </diffstat>
+
+        <diff>
+        diff --git a/src/config.rs b/src/config.rs
+        @@ -10,6 +10,8 @@ pub struct Config {
+             pub debug: bool,
+        +    /// Enable verbose logging
+        +    pub verbose: bool,
+         }
+        </diff>
+
+        <context>
+        Branch: feature/logging
+        </context>
+        EOF
+        )
+
+        MEDIUM_PROMPT=$(cat <<'EOF'
+        Write a commit message for the staged changes below.
+
+        <format>
+        - Subject under 50 chars, blank line, then optional body
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match recent commit style (conventional commits if used)
+        </style>
+
+        <diffstat>
+         src/auth/jwt.rs    | 45 +++++++++++++++++++++++++++++++++
+         src/auth/mod.rs    |  2 ++
+         src/middleware.rs  | 12 +++++++++
+         tests/auth_test.rs | 28 +++++++++++++++++++++
+         4 files changed, 87 insertions(+)
+        </diffstat>
+
+        <diff>
+        diff --git a/src/auth/jwt.rs b/src/auth/jwt.rs
+        new file mode 100644
+        +use jsonwebtoken::{encode, decode, Header, Validation};
+        +
+        +pub struct Claims { pub sub: String, pub exp: usize }
+        +
+        +pub fn create_token(user_id: &str, secret: &[u8]) -> Result<String, Error> {
+        +    let claims = Claims { sub: user_id.to_owned(), exp: ... };
+        +    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret))
+        +}
+        +
+        +pub fn validate_token(token: &str, secret: &[u8]) -> Result<Claims, Error> {
+        +    decode::<Claims>(token, &DecodingKey::from_secret(secret), &Validation::default())
+        +}
+        </diff>
+
+        <context>
+        Branch: feature/auth
+        <recent_commits>
+        - feat(api): add user registration endpoint
+        - fix(db): handle connection pool exhaustion
+        </recent_commits>
+        </context>
+        EOF
+        )
+
+        # Documented commands from llm-commits.md
+        declare -A COMMANDS
+        COMMANDS["claude"]='MAX_THINKING_TOKENS=0 claude -p --no-session-persistence --model=haiku --tools='"'"''"'"' --safe-mode --setting-sources='"'"'user'"'"' --system-prompt='"'"''"'"''
+        COMMANDS["llm"]='llm -m claude-haiku-4.5'
+        COMMANDS["aichat"]='aichat -m claude:claude-haiku-4.5 --code'
+        COMMANDS["codex"]='codex exec -m gpt-6-luna -c model_reasoning_effort='"'"'none'"'"' -c project_doc_max_bytes=0 -c skills.max_context_tokens=1 -c agents.enabled=false -c features.goals=false -c web_search=disabled -c '"'"'model_instructions_file="~/.codex/worktrunk-commit-instructions.txt"'"'"' -c features.shell_tool=false -c features.unified_exec=false -c features.apps=false -c features.plugins=false --ephemeral --sandbox=read-only --json - | jq -sr '"'"'[.[] | select(.item.type? == "agent_message")] | last.item.text'"'"''
+        COMMANDS["opencode"]='opencode run -m anthropic/claude-haiku-5-5 --variant fast'
+
+        # Check which tools are available
+        echo "=== LLM Commit Message Benchmark ==="
+        echo ""
+        echo "Checking available tools..."
+        AVAILABLE=()
+        for tool in claude llm aichat codex opencode; do
+          if command -v "$tool" &>/dev/null; then
+            echo "  ✓ $tool"
+            AVAILABLE+=("$tool")
+          else
+            echo "  ✗ $tool (not installed)"
+          fi
+        done
+        CODEX_READY=true
+        if command -v jq &>/dev/null; then
+          echo "  ✓ jq (required for codex)"
+        else
+          echo "  ✗ jq (required for codex)"
+          CODEX_READY=false
+        fi
+        if [ -s "$HOME/.codex/worktrunk-commit-instructions.txt" ]; then
+          echo "  ✓ Codex commit instructions"
+        else
+          echo "  ✗ Codex commit instructions (see llm-commits.md)"
+          CODEX_READY=false
+        fi
+        if [ "$CODEX_READY" = false ]; then
+          # Drop codex from the list. String substitution (${AVAILABLE[@]/codex})
+          # would rewrite the element to "" rather than remove it, leaving an
+          # empty tool name to iterate over later — rebuild the array instead.
+          FILTERED=()
+          for tool in "${AVAILABLE[@]}"; do
+            [ "$tool" = codex ] || FILTERED+=("$tool")
+          done
+          AVAILABLE=("${FILTERED[@]}")
+        fi
+        echo ""
+
+        if [ ${#AVAILABLE[@]} -eq 0 ]; then
+          echo "No tools available. Install at least one:"
+          echo "  claude: https://docs.anthropic.com/en/docs/claude-code"
+          echo "  llm: uv tool install llm llm-anthropic"
+          echo "  aichat: https://github.com/sigoden/aichat"
+          echo "  codex: npm install -g @openai/codex"
+          echo "  opencode: https://opencode.ai/download"
+          exit 1
+        fi
+
+        # Benchmark function
+        bench() {
+          local name="$1"
+          local cmd="$2"
+          local prompt="$3"
+          local start end elapsed output first_line
+
+          start=$(date +%s)
+          output=$(echo "$prompt" | eval "$cmd" 2>/dev/null) || output="[error]"
+          end=$(date +%s)
+          elapsed=$((end - start))
+          first_line=$(echo "$output" | head -1 | cut -c1-50)
+
+          printf "  %-8s %3ds  %s\n" "$name:" "$elapsed" "$first_line"
+        }
+
+        # Run benchmarks
+        for size in small medium; do
+          if [ "$size" = "small" ]; then
+            PROMPT="$SMALL_PROMPT"
+            echo "### Small diff (add verbose flag) ###"
+          else
+            PROMPT="$MEDIUM_PROMPT"
+            echo "### Medium diff (JWT auth module) ###"
+          fi
+          echo ""
+
+          for tool in "${AVAILABLE[@]}"; do
+            bench "$tool" "${COMMANDS[$tool]}" "$PROMPT"
+          done
+          echo ""
+        done
+
+        echo "Commands used (from docs/src/content/docs/llm-commits.md):"
+        for tool in "${AVAILABLE[@]}"; do
+          echo "  $tool: ${COMMANDS[$tool]}"
+        done
+
+  generate-logo:
+    desc: Generate logo using Gemini AI
+    dir: "{{.REPO_ROOT}}"
+    preconditions:
+      - sh: command -v gemimg
+        msg: "gemimg required. Install with: uv tool install gemimg"
+      - sh: command -v magick
+        msg: "imagemagick required. Install with: brew install imagemagick"
+      - sh: command -v rembg
+        msg: "rembg required. Install with: uv tool install rembg[cli]"
+      - sh: test -f dev/logo-prompt.json
+        msg: "dev/logo-prompt.json not found"
+    cmds:
+      - |
+        set -euo pipefail
+        RAW_FILE=".tmp/logo-raw.png"
+        SIZE_1X=512
+        SIZE_2X=1024
+        SIZE_FAVICON=32
+
+        mkdir -p .tmp
+
+        echo "Generating logo..."
+        gemimg "$(cat dev/logo-prompt.json)" \
+            --model gemini-3-pro-image-preview \
+            --aspect-ratio 1:1 \
+            -o "$RAW_FILE"
+
+        echo "Removing background..."
+        rembg i "$RAW_FILE" "$RAW_FILE"
+
+        echo "Processing sizes..."
+        magick "$RAW_FILE" -resize "${SIZE_1X}x${SIZE_1X}" "{{.STATIC_DIR}}/logo.png"
+        magick "$RAW_FILE" -resize "${SIZE_2X}x${SIZE_2X}" "{{.STATIC_DIR}}/logo@2x.png"
+        magick "$RAW_FILE" -resize "${SIZE_FAVICON}x${SIZE_FAVICON}" "{{.STATIC_DIR}}/favicon.png"
+        rm "$RAW_FILE"
+
+        echo "Done. Generated:"
+        ls -la "{{.STATIC_DIR}}"/logo.png "{{.STATIC_DIR}}"/logo@2x.png "{{.STATIC_DIR}}"/favicon.png

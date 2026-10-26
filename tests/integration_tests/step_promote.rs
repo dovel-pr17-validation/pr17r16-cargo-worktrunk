@@ -1,0 +1,1130 @@
+//! Integration tests for `wt step promote`
+
+use crate::common::{
+    TestRepo, add_force_duplicate, configure_git_env, make_snapshot_cmd, repo,
+    setup_snapshot_settings, wt_command,
+};
+use ansi_str::AnsiStr;
+use insta_cmd::assert_cmd_snapshot;
+use rstest::rstest;
+use std::fs;
+use worktrunk::shell_exec::Cmd;
+
+/// Helper to get the current branch in a directory
+fn branch_name(repo: &TestRepo, dir: &std::path::Path) -> String {
+    let output = repo
+        .git_command()
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Test promoting from another worktree (no argument)
+#[rstest]
+fn test_promote_from_worktree(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // Run promote from the worktree (no argument needed)
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote"],
+        Some(&feature_path),
+    ));
+
+    // Verify branches were exchanged
+    assert_eq!(
+        branch_name(&repo, repo.root_path()),
+        "feature",
+        "main worktree should now have feature"
+    );
+    assert_eq!(
+        branch_name(&repo, &feature_path),
+        "main",
+        "other worktree should now have main"
+    );
+}
+
+/// Test promoting by specifying branch name
+#[rstest]
+fn test_promote_with_branch_argument(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // Run promote from main worktree, specifying the branch
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+
+    // Verify branches were exchanged
+    assert_eq!(
+        branch_name(&repo, repo.root_path()),
+        "feature",
+        "main worktree should now have feature"
+    );
+    assert_eq!(
+        branch_name(&repo, &feature_path),
+        "main",
+        "other worktree should now have main"
+    );
+}
+
+/// A branch checked out in two worktrees (`git worktree add --force`) can't
+/// be exchanged: git won't check it out in the main worktree while the other
+/// copy holds it. Promote refuses before touching anything, here with the
+/// second copy named by its path, which used to promote the first.
+#[rstest]
+fn test_promote_refuses_duplicate_checkout_by_path(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let first = repo.add_worktree("feature");
+    let second = add_force_duplicate(&repo, "feature", "feature-copy");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", second.to_str().unwrap()],
+        Some(repo.root_path()),
+    ));
+
+    assert_eq!(branch_name(&repo, repo.root_path()), "main");
+    assert_eq!(branch_name(&repo, &first), "feature");
+    assert_eq!(branch_name(&repo, &second), "feature");
+}
+
+/// The other two routes to a duplicated branch: run with no argument from the
+/// second copy of the target, and a default branch checked out twice.
+#[rstest]
+#[case::target_from_second_copy("feature")]
+#[case::main_branch("main")]
+fn test_promote_refuses_duplicate_checkout(mut repo: TestRepo, #[case] duplicated: &str) {
+    let feature = repo.add_worktree("feature");
+    let copy = add_force_duplicate(&repo, duplicated, "copy");
+    let run_from = if duplicated == "feature" {
+        &copy
+    } else {
+        &feature
+    };
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote"])
+        .current_dir(run_from)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .to_string();
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("{duplicated} is checked out in 2 worktrees")),
+        "stderr: {stderr}"
+    );
+
+    assert_eq!(branch_name(&repo, repo.root_path()), "main");
+    assert_eq!(branch_name(&repo, &feature), "feature");
+    assert_eq!(branch_name(&repo, &copy), duplicated);
+}
+
+/// Test restoring canonical state
+#[rstest]
+fn test_promote_restore(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // First promote: feature to main worktree
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "first promote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify first promote worked
+    assert_eq!(branch_name(&repo, repo.root_path()), "feature");
+
+    // Restore: promote main back (now 'main' is in the other worktree)
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "main"],
+        Some(repo.root_path()),
+    ));
+
+    // Verify canonical state restored
+    assert_eq!(
+        branch_name(&repo, repo.root_path()),
+        "main",
+        "main worktree should have main again"
+    );
+    assert_eq!(
+        branch_name(&repo, &feature_path),
+        "feature",
+        "other worktree should have feature again"
+    );
+}
+
+/// Test when branch is already in main worktree
+#[rstest]
+fn test_promote_already_in_main(repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    // 'main' is already in main worktree
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "main"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test auto-restore with no argument from main worktree (after prior promote)
+#[rstest]
+fn test_promote_auto_restore(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // First promote: feature to main worktree (creates mismatch)
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "first promote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify first promote worked
+    assert_eq!(branch_name(&repo, repo.root_path()), "feature");
+    assert_eq!(branch_name(&repo, &feature_path), "main");
+
+    // Auto-restore: no argument from main worktree restores default branch
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote"],
+        Some(repo.root_path()),
+    ));
+
+    // Verify canonical state restored
+    assert_eq!(
+        branch_name(&repo, repo.root_path()),
+        "main",
+        "main worktree should have main again"
+    );
+    assert_eq!(
+        branch_name(&repo, &feature_path),
+        "feature",
+        "other worktree should have feature again"
+    );
+}
+
+/// Test auto-restore when no argument from main worktree (already canonical)
+#[rstest]
+fn test_promote_no_arg_from_main(repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    // From main worktree with no arg: restores default branch (already there)
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test error when branch has no worktree
+#[rstest]
+fn test_promote_branch_not_in_worktree(repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    // Create a branch but don't make a worktree for it
+    repo.run_git(&["branch", "orphan"]);
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "orphan"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test error when main worktree is dirty
+#[rstest]
+fn test_promote_dirty_main(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree("feature");
+
+    // Make main worktree dirty
+    fs::write(repo.root_path().join("dirty.txt"), "uncommitted").unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test error when target worktree is dirty
+#[rstest]
+fn test_promote_dirty_target(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // Make target worktree dirty
+    fs::write(feature_path.join("dirty.txt"), "uncommitted").unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test that wt list shows mismatch indicator after promote
+#[rstest]
+fn test_promote_shows_mismatch_in_list(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree("feature");
+
+    // Promote
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "promote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // List should show mismatch indicators
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "list",
+        &[],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Test error when run in a bare repository (no worktrees)
+#[test]
+fn test_promote_bare_repo_no_worktrees() {
+    let test = TestRepo::bare();
+
+    // Try to run promote in the bare repo - fails with "No worktrees found"
+    let output = test
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("No worktrees found"),
+        "Expected no worktrees error, got: {stderr}"
+    );
+}
+
+/// Test error when run in a bare repository with worktrees
+#[test]
+fn test_promote_bare_repo_with_worktrees() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let bare_repo = temp_dir.path().join("bare.git");
+    let worktree_path = temp_dir.path().join("worktree");
+    let temp_clone = temp_dir.path().join("temp");
+
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        let output = configure_git_env(Cmd::new("git"))
+            .args(args.iter().copied())
+            .current_dir(dir)
+            .run()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Create a bare repository
+    run_git(
+        temp_dir.path(),
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            bare_repo.to_str().unwrap(),
+        ],
+    );
+
+    // The push below starts a detached `git maintenance run --auto` in the
+    // bare repo, whose worktree-prune task can delete `worktrees/<name>` while
+    // `git worktree add` is still creating it. receive-pack drops the
+    // `GIT_CONFIG_*` env, so only the repo's own config can turn it off.
+    run_git(&bare_repo, &["config", "maintenance.auto", "false"]);
+
+    // Create a commit via a temporary clone
+    run_git(
+        temp_dir.path(),
+        &[
+            "clone",
+            bare_repo.to_str().unwrap(),
+            temp_clone.to_str().unwrap(),
+        ],
+    );
+    run_git(&temp_clone, &["commit", "--allow-empty", "-m", "init"]);
+    run_git(&temp_clone, &["push", "origin", "main"]);
+
+    // Add a worktree to the bare repo
+    run_git(
+        &bare_repo,
+        &["worktree", "add", worktree_path.to_str().unwrap(), "main"],
+    );
+
+    // Try to run promote in the bare repo - should fail with bare repo error
+    let output = wt_command()
+        .args(["step", "promote", "feature"])
+        .current_dir(&bare_repo)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("bare repositories"),
+        "Expected bare repo error, got: {stderr}"
+    );
+}
+
+/// Test error when main worktree has detached HEAD
+#[rstest]
+fn test_promote_detached_head_main(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree("feature");
+
+    // Detach HEAD in main worktree
+    let sha = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.root_path())
+        .run()
+        .unwrap();
+    let sha = String::from_utf8_lossy(&sha.stdout).trim().to_string();
+
+    repo.git_command()
+        .args(["checkout", "--detach", &sha])
+        .current_dir(repo.root_path())
+        .run()
+        .unwrap();
+
+    // Promote should fail due to detached HEAD
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Helper: commit a .gitignore in a worktree
+fn commit_gitignore(repo: &TestRepo, dir: &std::path::Path, content: &str) {
+    fs::write(dir.join(".gitignore"), content).unwrap();
+    repo.run_git_in(dir, &["add", ".gitignore"]);
+    repo.run_git_in(dir, &["commit", "-m", "add gitignore"]);
+}
+
+// ─── Swap tests ───────────────────────────────────────────────────────────
+
+/// Both worktrees have gitignored files — verify complete bidirectional swap
+#[rstest]
+fn test_promote_swap_bidirectional(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n*.log\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Main: build/main-artifact, app.log
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/main-artifact"), "main build").unwrap();
+    fs::write(repo.root_path().join("app.log"), "main log").unwrap();
+
+    // Feature: build/feature-artifact, debug.log
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/feature-artifact"), "feature build").unwrap();
+    fs::write(feature_path.join("debug.log"), "feature log").unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+
+    // Main worktree (now feature) should have feature's files
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/feature-artifact")).unwrap(),
+        "feature build"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("debug.log")).unwrap(),
+        "feature log"
+    );
+    assert!(!repo.root_path().join("build/main-artifact").exists());
+    assert!(!repo.root_path().join("app.log").exists());
+
+    // Feature worktree (now main) should have main's files
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/main-artifact")).unwrap(),
+        "main build"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("app.log")).unwrap(),
+        "main log"
+    );
+    assert!(!feature_path.join("build/feature-artifact").exists());
+    assert!(!feature_path.join("debug.log").exists());
+}
+
+/// Only main worktree has gitignored files — they should move to the other worktree
+#[rstest]
+fn test_promote_swap_only_main_has_ignored(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n*.log\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Only main has ignored files
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/artifact"), "main artifact").unwrap();
+    fs::write(repo.root_path().join("app.log"), "main log").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Main worktree should be clean (no ignored files)
+    assert!(!repo.root_path().join("build").exists());
+    assert!(!repo.root_path().join("app.log").exists());
+
+    // Feature worktree should have main's files
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/artifact")).unwrap(),
+        "main artifact"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("app.log")).unwrap(),
+        "main log"
+    );
+}
+
+/// `require-include` must not affect `wt step promote` — promote swaps all
+/// gitignored artifacts between worktrees by design and ignores copy-ignored
+/// config. Regression guard for the require-include feature.
+#[rstest]
+fn test_promote_swap_ignores_require_include(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n*.log\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // require-include is set via CLI override, but promote must still swap
+    // ignored files — it never reads copy-ignored config. Using --config-set
+    // avoids leaving an untracked .config/ that would itself block promote.
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/artifact"), "main artifact").unwrap();
+    fs::write(repo.root_path().join("app.log"), "main log").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args([
+            "--config-set",
+            "step.copy-ignored.require-include=true",
+            "step",
+            "promote",
+            "feature",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Ignored files still swapped to feature despite require-include.
+    assert!(!repo.root_path().join("build").exists());
+    assert!(!repo.root_path().join("app.log").exists());
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/artifact")).unwrap(),
+        "main artifact"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("app.log")).unwrap(),
+        "main log"
+    );
+}
+
+/// Only feature worktree has gitignored files — they should move to the main worktree
+#[rstest]
+fn test_promote_swap_only_feature_has_ignored(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Only feature has ignored files
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/artifact"), "feature artifact").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Main worktree should have feature's files
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/artifact")).unwrap(),
+        "feature artifact"
+    );
+
+    // Feature worktree should be clean
+    assert!(!feature_path.join("build").exists());
+}
+
+/// Neither worktree has gitignored files — promote should succeed without swap message
+#[rstest]
+fn test_promote_swap_no_ignored_files(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree("feature");
+
+    // No .gitignore, no ignored files — just promote
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// Directories with nested structure are swapped correctly (deep nesting)
+#[rstest]
+fn test_promote_swap_nested_directories(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Main: deep nested structure
+    fs::create_dir_all(repo.root_path().join("build/debug/x86/obj")).unwrap();
+    fs::write(
+        repo.root_path().join("build/debug/x86/obj/main.o"),
+        "main object",
+    )
+    .unwrap();
+    fs::write(repo.root_path().join("build/debug/main.bin"), "main binary").unwrap();
+
+    // Feature: different nested structure
+    fs::create_dir_all(feature_path.join("build/release/arm64")).unwrap();
+    fs::write(
+        feature_path.join("build/release/arm64/feature.bin"),
+        "feature binary",
+    )
+    .unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Main worktree should have feature's structure
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/release/arm64/feature.bin")).unwrap(),
+        "feature binary"
+    );
+    assert!(!repo.root_path().join("build/debug").exists());
+
+    // Feature worktree should have main's structure
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/debug/x86/obj/main.o")).unwrap(),
+        "main object"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/debug/main.bin")).unwrap(),
+        "main binary"
+    );
+    assert!(!feature_path.join("build/release").exists());
+}
+
+/// Same-named ignored files with different content are swapped (not clobbered)
+#[rstest]
+fn test_promote_swap_same_filename_different_content(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Both have build/output.bin with different content
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/output.bin"), "main output").unwrap();
+
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/output.bin"), "feature output").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Content should be swapped, not lost
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/output.bin")).unwrap(),
+        "feature output",
+        "main worktree should have feature's content"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/output.bin")).unwrap(),
+        "main output",
+        "feature worktree should have main's content"
+    );
+}
+
+/// Promote and restore round-trip preserves gitignored files
+#[rstest]
+fn test_promote_swap_roundtrip(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n*.log\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Create ignored files
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/artifact"), "main build").unwrap();
+    fs::write(repo.root_path().join("app.log"), "main log").unwrap();
+
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/artifact"), "feature build").unwrap();
+    fs::write(feature_path.join("debug.log"), "feature log").unwrap();
+
+    // Promote feature → main
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Restore: promote main back
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // After round-trip: everything should be back to original state
+    assert_eq!(branch_name(&repo, repo.root_path()), "main");
+    assert_eq!(branch_name(&repo, &feature_path), "feature");
+
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/artifact")).unwrap(),
+        "main build",
+        "main worktree should have its original build artifact back"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("app.log")).unwrap(),
+        "main log"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/artifact")).unwrap(),
+        "feature build",
+        "feature worktree should have its original build artifact back"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("debug.log")).unwrap(),
+        "feature log"
+    );
+}
+
+/// .worktreeinclude limits which ignored files are swapped
+#[rstest]
+fn test_promote_swap_respects_worktreeinclude(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    // .worktreeinclude only includes build/ — .env and *.log should NOT be swapped
+    let gitignore = "build/\n*.log\n.env\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Commit .worktreeinclude on both branches (must be tracked for clean worktree)
+    fs::write(repo.root_path().join(".worktreeinclude"), "build/\n").unwrap();
+    repo.run_git(&["add", ".worktreeinclude"]);
+    repo.run_git(&["commit", "-m", "add worktreeinclude"]);
+
+    fs::write(feature_path.join(".worktreeinclude"), "build/\n").unwrap();
+    repo.run_git_in(&feature_path, &["add", ".worktreeinclude"]);
+    repo.run_git_in(&feature_path, &["commit", "-m", "add worktreeinclude"]);
+
+    // Main: build/ + .env + app.log
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/main-bin"), "main binary").unwrap();
+    fs::write(repo.root_path().join(".env"), "MAIN_SECRET=1").unwrap();
+    fs::write(repo.root_path().join("app.log"), "main log").unwrap();
+
+    // Feature: build/ + .env + debug.log
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/feature-bin"), "feature binary").unwrap();
+    fs::write(feature_path.join(".env"), "FEATURE_SECRET=1").unwrap();
+    fs::write(feature_path.join("debug.log"), "feature log").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // build/ should be swapped (matches .worktreeinclude)
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/feature-bin")).unwrap(),
+        "feature binary"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/main-bin")).unwrap(),
+        "main binary"
+    );
+
+    // .env and *.log should NOT be swapped (excluded by .worktreeinclude)
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join(".env")).unwrap(),
+        "MAIN_SECRET=1",
+        ".env should stay in place"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("app.log")).unwrap(),
+        "main log",
+        "app.log should stay in place"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join(".env")).unwrap(),
+        "FEATURE_SECRET=1",
+        ".env should stay in place"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("debug.log")).unwrap(),
+        "feature log",
+        "debug.log should stay in place"
+    );
+}
+
+/// No stale staging directory left after successful promote
+#[rstest]
+fn test_promote_swap_no_staging_leftover(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/artifact"), "data").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The staging directory should be cleaned up
+    let git_dir = repo.root_path().join(".git");
+    assert!(
+        !git_dir.join("wt/staging/promote").exists(),
+        "staging directory should be cleaned up after promote"
+    );
+}
+
+/// Tracked files are not affected by the swap
+#[rstest]
+fn test_promote_swap_does_not_touch_tracked_files(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+
+    // Create a tracked file on main (committed, not ignored)
+    fs::write(repo.root_path().join("src.txt"), "main source").unwrap();
+    repo.run_git(&["add", "src.txt"]);
+    repo.run_git(&["commit", "-m", "add source"]);
+
+    // Create a tracked file on feature
+    fs::write(feature_path.join("feat.txt"), "feature source").unwrap();
+    repo.run_git_in(&feature_path, &["add", "feat.txt"]);
+    repo.run_git_in(&feature_path, &["commit", "-m", "add feat source"]);
+
+    // Create ignored files
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/main.o"), "main obj").unwrap();
+    fs::create_dir_all(feature_path.join("build")).unwrap();
+    fs::write(feature_path.join("build/feat.o"), "feat obj").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Tracked files should follow their branches (via git switch, not our swap)
+    // Main worktree (now on feature) should have feat.txt from git switch
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("feat.txt")).unwrap(),
+        "feature source"
+    );
+    // Feature worktree (now on main) should have src.txt from git switch
+    assert_eq!(
+        fs::read_to_string(feature_path.join("src.txt")).unwrap(),
+        "main source"
+    );
+
+    // Ignored files should be swapped by our code
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("build/feat.o")).unwrap(),
+        "feat obj"
+    );
+    assert_eq!(
+        fs::read_to_string(feature_path.join("build/main.o")).unwrap(),
+        "main obj"
+    );
+}
+
+/// Test that promote bails with guidance when stale staging directory exists
+#[rstest]
+fn test_promote_stale_staging_blocks_with_guidance(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // Need gitignored files so stage_ignored is actually called
+    let gitignore = "build/\n";
+    commit_gitignore(&repo, repo.root_path(), gitignore);
+    commit_gitignore(&repo, &feature_path, gitignore);
+    fs::create_dir_all(repo.root_path().join("build")).unwrap();
+    fs::write(repo.root_path().join("build/artifact"), "main build").unwrap();
+
+    // Create a fake leftover staging directory (as if previous promote was interrupted)
+    let git_dir = repo.root_path().join(".git");
+    let staging_dir = git_dir.join("wt/staging/promote");
+    fs::create_dir_all(staging_dir.join("a")).unwrap();
+    fs::write(staging_dir.join("a/leftover"), "leftover data").unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote", "feature"],
+        None
+    ));
+
+    // Staging dir should still exist (not destroyed)
+    assert!(staging_dir.exists(), "staging dir should be preserved");
+    assert_eq!(
+        fs::read_to_string(staging_dir.join("a/leftover")).unwrap(),
+        "leftover data"
+    );
+}
+
+/// Test error when linked worktree has detached HEAD (no-arg promote)
+#[rstest]
+fn test_promote_detached_head_linked(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // Detach HEAD in the linked worktree
+    let sha = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&feature_path)
+        .run()
+        .unwrap();
+    let sha = String::from_utf8_lossy(&sha.stdout).trim().to_string();
+
+    repo.git_command()
+        .args(["checkout", "--detach", &sha])
+        .current_dir(&feature_path)
+        .run()
+        .unwrap();
+
+    // No-arg promote from linked worktree should fail due to detached HEAD
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &["promote"],
+        Some(&feature_path),
+    ));
+}
+
+/// `step promote --format=json` reports `already_in_main` when target branch is
+/// already in the main worktree, mirroring `step rebase --format=json` shape.
+#[rstest]
+fn test_promote_already_in_main_json(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree("feature");
+
+    // 'main' is already in main worktree
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "main", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON to stdout");
+    assert_eq!(parsed["outcome"], "already_in_main");
+    assert_eq!(parsed["branch"], "main");
+}
+
+/// `step promote --format=json` reports `promoted` with target, main_branch,
+/// swapped count, and mismatch flag when a feature branch is promoted.
+#[rstest]
+fn test_promote_swap_json(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let _feature_path = repo.add_worktree_with_commit("feature", "f.txt", "x", "feat: x");
+
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "feature", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "promote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON to stdout");
+    assert_eq!(parsed["outcome"], "promoted");
+    assert_eq!(parsed["target"], "feature");
+    assert_eq!(parsed["main_branch"], "main");
+    assert_eq!(parsed["swapped"], 0);
+    assert_eq!(parsed["mismatch"], true);
+
+    // The mismatch warning still appears on stderr even in JSON mode (safety signal).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mismatched worktree state"),
+        "expected mismatch warning on stderr, got: {stderr}"
+    );
+    // The "Promoted:" success line also goes to stderr in JSON mode, matching
+    // `rebase`/`push`: the human status line is stderr, the JSON on stdout is
+    // the machine-readable signal.
+    assert!(
+        stderr.contains("Promoted:"),
+        "expected promote success line on stderr, got: {stderr}"
+    );
+}
+
+/// `step promote --format=json` reports `mismatch: false` when restoring the
+/// default branch back to the main worktree.
+#[rstest]
+fn test_promote_restore_json(mut repo: TestRepo) {
+    let _settings_guard = setup_snapshot_settings(&repo).bind_to_scope();
+    let feature_path = repo.add_worktree("feature");
+
+    // First promote creates mismatch (main now has feature)
+    repo.wt_command()
+        .args(["step", "promote", "feature"])
+        .output()
+        .unwrap();
+
+    // Now restore — promote the default branch (main) back
+    let output = repo
+        .wt_command()
+        .args(["step", "promote", "main", "--format=json"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON to stdout");
+    assert_eq!(parsed["outcome"], "promoted");
+    assert_eq!(parsed["target"], "main");
+    assert_eq!(parsed["main_branch"], "feature");
+    assert_eq!(parsed["swapped"], 0);
+    assert_eq!(parsed["mismatch"], false);
+}

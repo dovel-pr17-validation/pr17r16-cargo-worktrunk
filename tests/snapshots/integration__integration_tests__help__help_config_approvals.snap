@@ -1,0 +1,123 @@
+---
+source: tests/integration_tests/help.rs
+info:
+  program: wt
+  args:
+    - config
+    - approvals
+    - "--help"
+  env:
+    CLICOLOR_FORCE: "1"
+    COLUMNS: "500"
+    GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
+    LANG: C
+    LC_ALL: C
+    LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
+    TERM: alacritty
+    WORKTRUNK_APPROVALS_PATH: "[TEST_APPROVALS]"
+    WORKTRUNK_CONFIG_PATH: "[TEST_CONFIG]"
+    WORKTRUNK_SYSTEM_CONFIG_PATH: "[TEST_SYSTEM_CONFIG]"
+    WORKTRUNK_TEST_BASH_INSTALLED: "0"
+    WORKTRUNK_TEST_CLAUDE_INSTALLED: "0"
+    WORKTRUNK_TEST_CODEX_INSTALLED: "0"
+    WORKTRUNK_TEST_DELAYED_STREAM_MS: "-1"
+    WORKTRUNK_TEST_EPOCH: "1735776000"
+    WORKTRUNK_TEST_FISH_INSTALLED: "0"
+    WORKTRUNK_TEST_GEMINI_INSTALLED: "0"
+    WORKTRUNK_TEST_NUSHELL_ENV: "0"
+    WORKTRUNK_TEST_OPENCODE_INSTALLED: "0"
+    WORKTRUNK_TEST_PARENT_SHELL: ""
+    WORKTRUNK_TEST_POWERSHELL_ENV: "0"
+    WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
+    WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
+    WORKTRUNK_TEST_ZSH_INSTALLED: "0"
+---
+success: true
+exit_code: 0
+----- stdout -----
+wt config approvals - Manage command approvals
+
+Usage: [1m[36mwt config approvals[0m [36m[OPTIONS][0m [36m<COMMAND>[0m
+
+[1m[32mCommands:[0m
+  [1m[36mlist[0m   List project commands and their approval status
+  [1m[36madd[0m    Store approvals in approvals.toml
+  [1m[36mclear[0m  Clear approved commands from approvals.toml
+
+[1m[32mOptions:[0m
+  [1m[36m-h[0m, [1m[36m--help[0m
+          Print help (see a summary with '-h')
+
+[1m[32mGlobal Options:[0m
+  [1m[36m-C[0m[36m [0m[36m<path>[0m
+          Working directory for this command
+
+      [1m[36m--config[0m[36m [0m[36m<path>[0m
+          User config file path
+
+      [1m[36m--config-set[0m[36m [0m[36m<toml>[0m
+          Override config with inline TOML, e.g. --config-set list.full=true (repeatable)
+
+  [1m[36m-v[0m, [1m[36m--verbose[0m[36m...[0m
+          Verbose output (-v: info logs + hook/alias template variables on stderr; -vv: also debug logs and raw subprocess output written to .git/wt/logs/). Set WORKTRUNK_VERBOSE=0|1|2 to apply the same level everywhere — including shell completion, which no flag can reach
+
+  [1m[36m-y[0m, [1m[36m--yes[0m
+          Skip approval prompts
+
+Project hooks and project aliases prompt for approval on first run to prevent untrusted projects from running arbitrary commands. Approvals from both flows are stored together.
+
+[1m[32mExamples[0m
+
+List commands and their approval status for current project:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals list[0m
+
+Pre-approve all hook and alias commands for current project:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals add[0m
+
+Pre-approve without prompting, for a container or CI job:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals add [0m[2m[36m--yes[0m
+
+Clear approvals for current project:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals clear[0m
+
+Clear only approvals for commands no longer in the project config:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals clear [0m[2m[36m--stale[0m
+
+Clear global approvals:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals clear [0m[2m[36m--global[0m
+
+Check whether an unattended run would stop for approval:
+[107m [0m [2m[0m[2m[34mwt[0m[2m config approvals list [0m[2m[36m--format=json[0m[2m [0m[2m[36m|[0m[2m [0m[2m[34mjq[0m[2m [0m[2m[36m-r[0m[2m .state[0m
+
+[1m[32mHow approvals work[0m
+
+Approved commands are saved to [2m~/.config/worktrunk/approvals.toml[0m. Re-approval is required when the command template changes or the project moves.
+
+[2m--yes[0m approves project commands for the current run without saving approval. [2mwt config approvals add --yes[0m saves approvals for future runs.
+
+[1m[32mReading approval state[0m
+
+[2mwt config approvals list[0m reads the state without prompting or writing it, so an orchestrator can find out whether a non-interactive run will stop for approval before scheduling one. [2m--format=json[0m emits:
+
+[107m [0m [2m{[0m
+[107m [0m [2m  "state": "approval_required",[0m
+[107m [0m [2m  "commands": [[0m
+[107m [0m [2m    {"phase": "post-start", "name": "dev", "template": "npm run dev", "approved": false},[0m
+[107m [0m [2m    {"phase": "pre-merge", "template": "cargo test", "approved": true}[0m
+[107m [0m [2m  ],[0m
+[107m [0m [2m  "stale": ["some removed command"][0m
+[107m [0m [2m}[0m
+
+[2mstate[0m is [2mno_commands[0m (the project declares none), [2mapproval_required[0m (at least one is unapproved), or [2mapproved[0m. [2mname[0m is absent for an unnamed command and for the commit-template fragment.
+
+[2mstale[0m, which can accompany any [2mstate[0m, lists approvals whose command has since been edited or removed from the project config.
+
+----- stderr -----

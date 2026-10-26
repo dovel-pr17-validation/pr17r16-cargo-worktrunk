@@ -1,0 +1,328 @@
+//! Tests for progressive rendering in `wt list`
+//!
+//! These tests capture multiple snapshots of the output as it renders,
+//! verifying that the table structure appears first and data fills in progressively.
+#![cfg(all(unix, feature = "shell-integration-tests"))]
+
+use crate::common::progressive_output::{ProgressiveCaptureOptions, capture_progressive_output};
+use crate::common::pty::{build_pty_command, exec_cmd_in_pty};
+use crate::common::{TestRepo, repo, wt_bin};
+use ansi_str::AnsiStr;
+use rstest::rstest;
+
+/// Loading footers describe the inventory separately from the displayed rows,
+/// both before results arrive and as rows fill in. Capture the complete PTY
+/// stream so even a fast run must exercise its initial loading footer.
+#[test]
+fn test_list_progressive_loading_footer() {
+    let mut repo = TestRepo::standard_main_only();
+    repo.add_worktree("feature-a");
+    repo.add_worktree("feature-b");
+    for branch in ["branch-a", "branch-b"] {
+        repo.run_git(&["branch", branch]);
+    }
+
+    for (height, expected) in [
+        (30, "○ 3 worktrees, 2 branches — loading details…"),
+        (
+            9,
+            "○ 3 worktrees, 2 branches — first 3 of 5 shown — loading details…",
+        ),
+    ] {
+        let pair = crate::common::open_pty_with_size(height, 150);
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["list", "--progressive", "--branches"],
+            repo.root_path(),
+            &repo.test_env_vars(),
+            None,
+        );
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (raw, exit_code) =
+            crate::common::pty::read_pty_output(reader, writer, pair.master, &mut child);
+        assert_eq!(exit_code, 0);
+        let output = raw.ansi_strip();
+        let loading_footers: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("loading details…"))
+            .map(|line| &line[line.find('○').unwrap()..])
+            .collect();
+        assert!(
+            !loading_footers.is_empty(),
+            "initial footer missing: {output}"
+        );
+        for footer in loading_footers {
+            assert_eq!(footer.trim_end(), expected);
+        }
+        assert!(
+            output.contains("Showing 3 worktrees, 2 branches"),
+            "final summary missing: {output}"
+        );
+    }
+}
+
+/// Tests progressive rendering with multiple worktrees.
+/// Verifies: headers appear immediately, dots decrease over time, all worktrees visible.
+/// (Consolidates previous tests: rendering_basic, dots_decrease, many_worktrees)
+#[rstest]
+fn test_list_progressive_rendering(mut repo: TestRepo) {
+    // Create many worktrees to ensure rendering takes time
+    for i in 1..=10 {
+        repo.add_worktree(&format!("branch-{:02}", i));
+    }
+
+    let output = capture_progressive_output(
+        &repo,
+        "list",
+        &["--full", "--branches"],
+        ProgressiveCaptureOptions::with_byte_interval(500),
+    );
+
+    // Basic assertions
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stages.len() >= 3,
+        "Should capture at least 3 stages with many worktrees, got {}",
+        output.stages.len()
+    );
+
+    // Verify progressive filling: dots should decrease over time
+    output.verify_progressive_filling().unwrap();
+
+    // Verify table header appears in initial output
+    let initial = output.initial().visible_text();
+    assert!(
+        initial.contains("Branch"),
+        "Table header should appear immediately"
+    );
+    assert!(
+        initial.contains("Status"),
+        "Status column header should appear immediately"
+    );
+
+    // Verify final output has all worktrees
+    let final_output = output.final_output();
+    for i in 1..=10 {
+        assert!(
+            final_output.contains(&format!("branch-{:02}", i)),
+            "Final output should contain branch-{:02}",
+            i
+        );
+    }
+}
+
+/// Tests progressive output capture API: timestamps and snapshot_at.
+/// (Consolidates previous tests: timing, snapshot_at)
+#[rstest]
+fn test_list_progressive_api(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+
+    let output = capture_progressive_output(
+        &repo,
+        "list",
+        &[],
+        ProgressiveCaptureOptions::with_byte_interval(600),
+    );
+
+    // Verify timestamps are monotonically increasing
+    for i in 1..output.stages.len() {
+        assert!(
+            output.stages[i].timestamp >= output.stages[i - 1].timestamp,
+            "Timestamps should increase monotonically"
+        );
+    }
+
+    // Test snapshot_at API
+    let snapshot = output.snapshot_at(std::time::Duration::from_millis(100));
+    assert!(
+        !snapshot.visible_text().is_empty(),
+        "Snapshot should have content"
+    );
+    assert!(
+        snapshot.timestamp < output.total_duration,
+        "Snapshot should be before end"
+    );
+}
+
+/// Tests overflow mode: when worktrees exceed terminal height, the skeleton shows a subset,
+/// then finalize erases and prints the complete table (scrolls naturally).
+#[rstest]
+fn test_list_progressive_overflow(mut repo: TestRepo) {
+    // Create enough worktrees to overflow a 10-row terminal.
+    // With height=10: visible_rows = 10 - 4 (header + spacer + footer + cursor)
+    // - 2 (prompt reserve) = 4. 10 worktrees + main = 11 rows, well above that.
+    for i in 1..=10 {
+        repo.add_worktree(&format!("overflow-{:02}", i));
+    }
+
+    let mut opts = ProgressiveCaptureOptions::with_byte_interval(500);
+    opts.terminal_size = (10, 150); // Short terminal triggers overflow
+
+    let output = capture_progressive_output(&repo, "list", &["--full", "--branches"], opts);
+
+    assert_eq!(output.exit_code, 0);
+
+    // The overflow finalize path erases the skeleton and prints the complete table,
+    // which scrolls naturally. The vt100 parser (10 rows, no scrollback) only captures
+    // the visible tail. Verify: the footer and later branches are visible, confirming
+    // the overflow finalize path executed and printed the full table.
+    let final_text = output.final_output();
+
+    // Footer should be visible at the bottom
+    assert!(
+        final_text.contains("Showing"),
+        "Footer should be visible after overflow finalize.\nFinal output:\n{final_text}"
+    );
+
+    // Later branches should be visible (earlier ones scrolled off the 10-row viewport)
+    assert!(
+        final_text.contains("overflow-10"),
+        "Last branch should be visible.\nFinal output:\n{final_text}"
+    );
+
+    // No placeholder dots should remain — finalize printed real data
+    assert!(
+        !final_text.contains('·'),
+        "No placeholder dots should remain after finalize.\nFinal output:\n{final_text}"
+    );
+
+    // The prompt reserve leaves the cursor two rows above the bottom of the
+    // scrolled screen, with the footer directly above it — the shell prompt
+    // printed after exit renders into the reserved rows instead of scrolling
+    // the settled table.
+    assert_eq!(
+        output.final_cursor,
+        (7, 0),
+        "Cursor should rest 2 reserved rows above the bottom of the 10-row \
+         terminal.\nFinal output:\n{final_text}"
+    );
+}
+
+/// A wrapped final footer occupies several physical rows. The progressive
+/// renderer must preserve every row instead of applying one width budget to
+/// the whole string and replacing the continuation with an ellipsis.
+#[rstest]
+fn test_list_progressive_wraps_final_footer(mut repo: TestRepo) {
+    for branch in ["feature-alpha", "feature-beta", "feature-gamma"] {
+        repo.add_worktree(branch);
+    }
+
+    let mut opts = ProgressiveCaptureOptions::with_byte_interval(500);
+    opts.terminal_size = (24, 40);
+
+    let output = capture_progressive_output(&repo, "list", &[], opts);
+    assert_eq!(output.exit_code, 0);
+
+    let final_text = output.final_output();
+    let footer = final_text
+        .split_once("Showing")
+        .map(|(_, footer)| footer)
+        .expect("final output should contain the summary footer");
+    assert!(footer.contains("hidden:"), "footer:\n{footer}");
+    assert!(footer.contains("Path"), "footer:\n{footer}");
+    assert!(
+        !footer.lines().any(|line| line.trim() == "…"),
+        "footer:\n{footer}"
+    );
+
+    // The footer redraw moves up exactly one row before clearing. An
+    // off-by-one there would swallow the spacer and every assertion above
+    // would still pass, since they only look below "Showing".
+    let rows: Vec<_> = final_text.lines().collect();
+    let footer_start = rows
+        .iter()
+        .position(|row| row.contains("Showing"))
+        .expect("final output should contain the summary footer");
+    assert!(
+        rows[footer_start - 1].trim().is_empty(),
+        "spacer row should survive the footer redraw.\nFinal output:\n{final_text}"
+    );
+}
+
+/// Tests progressive rendering with no worktrees (fast path).
+#[rstest]
+fn test_list_progressive_fast_command(repo: TestRepo) {
+    let output = capture_progressive_output(
+        &repo,
+        "list",
+        &[],
+        ProgressiveCaptureOptions::with_byte_interval(600),
+    );
+
+    assert_eq!(output.exit_code, 0);
+
+    // Even fast commands should capture at least the final state
+    assert!(
+        !output.stages.is_empty(),
+        "Should capture at least one snapshot"
+    );
+
+    assert!(
+        output.final_output().contains("Branch"),
+        "Should have table header"
+    );
+
+    // The prompt-reserve rows are emitted below the footer with the cursor
+    // moved back over them: it rests directly under the last content row, so
+    // a reserve/MoveUp mismatch would show up as a displaced cursor.
+    let content_rows = output.final_output().trim_end().lines().count() as u16;
+    assert_eq!(
+        output.final_cursor,
+        (content_rows, 0),
+        "Cursor should rest directly under the footer.\nFinal output:\n{}",
+        output.final_output()
+    );
+}
+
+/// The progressive render applies the stream's resolved color choice to its
+/// content: under `NO_COLOR` the raw PTY byte stream carries no SGR sequence
+/// while the cursor-control CSI the in-place redraw is built on still flows —
+/// distinguishing a stripped progressive render from a fall-through to the
+/// buffered path, whose stream would carry no escapes at all. The forced run
+/// proves the same command emits SGR when color is on, so the absence check
+/// can't pass vacuously.
+#[rstest]
+fn test_list_progressive_honors_no_color(mut repo: TestRepo) {
+    repo.add_worktree("feature-color");
+    let sgr = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+
+    let capture = |no_color: bool| {
+        let mut cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["list", "--full", "--branches"],
+            repo.root_path(),
+            &repo.test_env_vars(),
+            None,
+        );
+        if no_color {
+            // configure_pty_command sets the suite's CLICOLOR_FORCE=1, which
+            // outranks NO_COLOR in anstream's resolution — remove it so the
+            // choice resolves to Never.
+            cmd.env_remove("CLICOLOR_FORCE");
+            cmd.env("NO_COLOR", "1");
+        }
+        exec_cmd_in_pty(cmd, "")
+    };
+
+    let (plain, exit_code) = capture(true);
+    assert_eq!(exit_code, 0);
+    assert!(plain.contains("feature-color"), "output:\n{plain}");
+    assert!(
+        plain.contains("\x1b["),
+        "cursor-control CSI should still flow under NO_COLOR:\n{plain:?}"
+    );
+    assert!(
+        !sgr.is_match(&plain),
+        "no SGR should reach the terminal under NO_COLOR:\n{plain:?}"
+    );
+
+    let (forced, exit_code) = capture(false);
+    assert_eq!(exit_code, 0);
+    assert!(
+        sgr.is_match(&forced),
+        "forced color should emit SGR:\n{forced:?}"
+    );
+}

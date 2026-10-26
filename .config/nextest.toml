@@ -1,0 +1,19 @@
+# Older nextest suspends (SIGTTOU) when a test spawns an interactive shell
+# (zsh -ic, bash -ic), as the shell-integration-tests feature does; fixed in
+# 0.9.118 (https://github.com/nextest-rs/nextest/issues/2878).
+nextest-version = "0.9.118"
+
+# Nothing in this file may change what a test observes — no `[env]`, no setup
+# scripts. `cargo test`, `cargo llvm-cov`, `cargo bench` and the Nix derivation
+# run this same suite and would silently disagree. Environment belongs in the
+# hermetic latch (`shell_exec::enable_hermetic_test_env`) and
+# `.cargo/config.toml`, behavior in the fixture. See
+# tests/AGENTS.md → One Result Per Test, Whatever Runs It.
+
+[profile.default]
+slow-timeout = { period = "180s", terminate-after = 1 }
+status-level = "fail"
+success-output = "never"
+
+[profile.default.junit]
+path = "junit.xml"

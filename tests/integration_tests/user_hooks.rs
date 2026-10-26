@@ -1,0 +1,5501 @@
+//! Integration tests for user-level hooks (~/.config/worktrunk/config.toml)
+//!
+//! User hooks differ from project hooks:
+//! - Run for all repositories
+//! - Execute before project hooks
+//! - Don't require approval
+//! - Skipped together with project hooks via --no-hooks
+
+use crate::common::{
+    SLEEP_FOR_ABSENCE_CHECK, TestRepo, make_snapshot_cmd, make_snapshot_cmd_with_global_flags,
+    repo, repo_with_remote, resolve_git_common_dir, setup_snapshot_settings, wait_for_file,
+    wait_for_file_content, wait_for_file_count,
+};
+use insta::assert_snapshot;
+use insta_cmd::assert_cmd_snapshot;
+use path_slash::PathExt as _;
+use rstest::rstest;
+use std::fs;
+use std::thread;
+use std::time::Duration;
+use worktrunk::config::HookSource;
+
+#[rstest]
+#[cfg(unix)]
+fn test_concurrent_hooks_log_labels_and_pass_cd_directive(repo: TestRepo) {
+    repo.write_project_config(
+        r#"[pre-start]
+first = 'printf CD > "$WORKTRUNK_DIRECTIVE_CD_FILE"'
+second = 'true'
+"#,
+    );
+    let cd_file = repo.home_path().join("cd-directive");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes"])
+        .env("WORKTRUNK_DIRECTIVE_CD_FILE", &cd_file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(cd_file).unwrap(), "CD");
+    let log = fs::read_to_string(repo.root_path().join(".git/wt/logs/commands.jsonl")).unwrap();
+    let mut labels: Vec<String> = log
+        .lines()
+        .map(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(entry["exit"], 0);
+            entry["label"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    labels.sort();
+    assert_eq!(
+        labels,
+        ["pre-start project:first", "pre-start project:second"]
+    );
+}
+
+/// A Git checkout hook interrupts its owned Git parent during worktree creation.
+/// The creation error's presentation must retain the command's native status.
+#[rstest]
+#[case::interrupt("INT", 130)]
+#[case::terminate("TERM", 143)]
+#[cfg(unix)]
+fn test_worktree_creation_preserves_git_hook_interrupt(
+    repo: TestRepo,
+    #[case] signal: &str,
+    #[case] expected: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hook = resolve_git_common_dir(repo.root_path()).join("hooks/post-checkout");
+    let marker = repo.root_path().join("git-hook-ran");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf called > {}\nkill -{signal} \"$PPID\"\n",
+            shell_escape::escape(marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "interrupted", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(fs::read_to_string(marker).unwrap(), "called");
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(expected),
+        "{output:?}",
+    );
+}
+
+// ============================================================================
+// User Post-Create Hook Tests
+// ============================================================================
+
+/// Helper to create snapshot for switch commands
+fn snapshot_switch(test_name: &str, repo: &TestRepo, args: &[&str]) {
+    let settings = setup_snapshot_settings(repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(repo, "switch", args, None);
+        assert_cmd_snapshot!(test_name, cmd);
+    });
+}
+
+#[rstest]
+fn test_user_pre_start_hook_executes(repo: TestRepo) {
+    // Write user config with pre-start hook (no project config)
+    repo.write_test_config(
+        r#"[pre-start]
+log = "echo 'USER_PRE_CREATE_RAN' > user_hook_marker.txt"
+"#,
+    );
+
+    snapshot_switch("user_pre_start_executes", &repo, &["--create", "feature"]);
+
+    // Verify user hook actually ran
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("user_hook_marker.txt");
+    assert!(
+        marker_file.exists(),
+        "User pre-start hook should have created marker file"
+    );
+
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert!(
+        contents.contains("USER_PRE_CREATE_RAN"),
+        "Marker file should contain expected content"
+    );
+}
+
+#[rstest]
+fn test_user_hooks_run_before_project_hooks(repo: TestRepo) {
+    // Create project config with pre-start hook
+    repo.write_project_config(r#"pre-start = "echo 'PROJECT_HOOK' >> hook_order.txt""#);
+    repo.commit("Add project config");
+
+    // Write user config with user hook AND pre-approve project command
+    repo.write_test_config(
+        r#"[pre-start]
+log = "echo 'USER_HOOK' >> hook_order.txt"
+"#,
+    );
+    repo.write_test_approvals(
+        r#"[projects."../origin"]
+approved-commands = ["echo 'PROJECT_HOOK' >> hook_order.txt"]
+"#,
+    );
+
+    snapshot_switch("user_hooks_before_project", &repo, &["--create", "feature"]);
+
+    // Verify execution order
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let order_file = worktree_path.join("hook_order.txt");
+    assert!(order_file.exists());
+
+    let contents = fs::read_to_string(&order_file).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "USER_HOOK", "User hook should run first");
+    assert_eq!(lines[1], "PROJECT_HOOK", "Project hook should run second");
+}
+
+#[rstest]
+fn test_user_hooks_no_approval_required(repo: TestRepo) {
+    // Write user config with hook but NO pre-approved commands
+    // (unlike project hooks, user hooks don't require approval)
+    repo.write_test_config(
+        r#"[pre-start]
+setup = "echo 'NO_APPROVAL_NEEDED' > no_approval.txt"
+"#,
+    );
+
+    snapshot_switch("user_hooks_no_approval", &repo, &["--create", "feature"]);
+
+    // Verify hook ran without approval
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("no_approval.txt");
+    assert!(
+        marker_file.exists(),
+        "User hook should run without pre-approval"
+    );
+}
+
+#[rstest]
+fn test_no_hooks_flag_skips_all_hooks(repo: TestRepo) {
+    // Create project config with pre-start hook
+    repo.write_project_config(r#"pre-start = "echo 'PROJECT_HOOK' > project_marker.txt""#);
+    repo.commit("Add project config");
+
+    // Write user config with both user hook and pre-approved project command
+    repo.write_test_config(
+        r#"[pre-start]
+log = "echo 'USER_HOOK' > user_marker.txt"
+"#,
+    );
+    repo.write_test_approvals(
+        r#"[projects."../origin"]
+approved-commands = ["echo 'PROJECT_HOOK' > project_marker.txt"]
+"#,
+    );
+
+    // Create worktree with --no-hooks (skips ALL hooks)
+    snapshot_switch(
+        "no_hooks_skips_all_hooks",
+        &repo,
+        &["--create", "feature", "--no-hooks"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    // User hook should NOT have run
+    let user_marker = worktree_path.join("user_marker.txt");
+    assert!(
+        !user_marker.exists(),
+        "User hook should be skipped with --no-hooks"
+    );
+
+    // Project hook should also NOT have run (--no-hooks skips ALL hooks)
+    let project_marker = worktree_path.join("project_marker.txt");
+    assert!(
+        !project_marker.exists(),
+        "Project hook should also be skipped with --no-hooks"
+    );
+}
+
+#[rstest]
+fn test_user_pre_start_hook_failure(repo: TestRepo) {
+    // Write user config with failing hook
+    repo.write_test_config(
+        r#"[pre-start]
+failing = "exit 1"
+"#,
+    );
+
+    // A failing pre-start hook aborts with FailFast. The worktree is created
+    // before pre-start runs, so it exists even though the command exits non-zero.
+    snapshot_switch("user_pre_start_failure", &repo, &["--create", "feature"]);
+
+    // Worktree exists (created before pre-start ran) but the command failed
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    assert!(
+        worktree_path.exists(),
+        "Worktree should exist — it was created before pre-start ran"
+    );
+}
+
+// ============================================================================
+// User Post-Start Hook Tests (Background)
+// ============================================================================
+
+#[rstest]
+fn test_user_post_start_hook_executes(repo: TestRepo) {
+    // Write user config with post-start hook (background)
+    repo.write_test_config(
+        r#"[post-start]
+bg = "echo 'USER_POST_CREATE_RAN' > user_bg_marker.txt"
+"#,
+    );
+
+    snapshot_switch("user_post_start_executes", &repo, &["--create", "feature"]);
+
+    // Wait for background hook to complete and write content
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("user_bg_marker.txt");
+    wait_for_file_content(&marker_file);
+
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert!(
+        contents.contains("USER_POST_CREATE_RAN"),
+        "User post-start hook should have run in background"
+    );
+}
+
+#[rstest]
+fn test_background_hook_sees_worktrunk_foreground_env_var(repo: TestRepo) {
+    // Background hooks run via the detached `wt hook run-pipeline` runner; wt
+    // sets WORKTRUNK_FOREGROUND=-1 on that process so descendants (shell,
+    // user command, nested `wt` invocations) can tell they're backgrounded.
+    // `pre-*` hooks run synchronously in the foreground `wt` process, so they
+    // must NOT see the sentinel.
+    repo.write_test_config(
+        r#"[post-start]
+capture-bg = "echo \"bg=$WORKTRUNK_FOREGROUND\" > post_start_env.txt"
+
+[pre-start]
+capture-fg = "echo \"fg=$WORKTRUNK_FOREGROUND\" > pre_start_env.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "background_hook_env_var_visible",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    // pre-start wrote its marker synchronously; post-start runs in the
+    // background, so poll for the file.
+    let bg_marker = worktree_path.join("post_start_env.txt");
+    wait_for_file_content(&bg_marker);
+    let bg = fs::read_to_string(&bg_marker).unwrap();
+    assert_eq!(
+        bg.trim(),
+        "bg=-1",
+        "post-start (background) hook should see WORKTRUNK_FOREGROUND=-1, got {bg:?}"
+    );
+
+    let fg_marker = worktree_path.join("pre_start_env.txt");
+    let fg = fs::read_to_string(&fg_marker).unwrap();
+    assert_eq!(
+        fg.trim(),
+        "fg=",
+        "pre-start (foreground) hook should NOT see WORKTRUNK_FOREGROUND set, got {fg:?}"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_skipped_with_no_hooks(repo: TestRepo) {
+    // Write user config with post-start hook
+    repo.write_test_config(
+        r#"[post-start]
+bg = "echo 'USER_BG' > user_bg_marker.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_skipped_no_hooks",
+        &repo,
+        &["--create", "feature", "--no-hooks"],
+    );
+
+    // Wait to ensure background hook would have had time to run
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("user_bg_marker.txt");
+    assert!(
+        !marker_file.exists(),
+        "User post-start hook should be skipped with --no-hooks"
+    );
+}
+
+// ============================================================================
+// User Pre-Merge Hook Tests
+// ============================================================================
+
+/// Helper for merge snapshots
+fn snapshot_merge(test_name: &str, repo: &TestRepo, args: &[&str], cwd: Option<&std::path::Path>) {
+    let settings = setup_snapshot_settings(repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(repo, "merge", args, cwd);
+        assert_cmd_snapshot!(test_name, cmd);
+    });
+}
+
+#[rstest]
+fn test_user_pre_merge_hook_executes(mut repo: TestRepo) {
+    // Create feature worktree with a commit
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Write user config with pre-merge hook
+    repo.write_test_config(
+        r#"[pre-merge]
+check = "echo 'USER_PRE_MERGE_RAN' > user_premerge.txt"
+"#,
+    );
+
+    snapshot_merge(
+        "user_pre_merge_executes",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+
+    // Verify user hook ran
+    let marker_file = feature_wt.join("user_premerge.txt");
+    assert!(marker_file.exists(), "User pre-merge hook should have run");
+}
+
+#[rstest]
+fn test_user_pre_merge_hook_failure_blocks_merge(mut repo: TestRepo) {
+    // Create feature worktree with a commit
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Write user config with failing pre-merge hook
+    repo.write_test_config(
+        r#"[pre-merge]
+check = "exit 1"
+"#,
+    );
+
+    // Failing pre-merge hook should block the merge
+    snapshot_merge(
+        "user_pre_merge_failure",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+}
+
+#[rstest]
+fn test_user_pre_merge_skipped_with_no_hooks(mut repo: TestRepo) {
+    // Create feature worktree with a commit
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Write user config with pre-merge hook that creates a marker
+    repo.write_test_config(
+        r#"[pre-merge]
+check = "echo 'USER_PRE_MERGE' > user_premerge_marker.txt"
+"#,
+    );
+
+    snapshot_merge(
+        "user_pre_merge_skipped_no_hooks",
+        &repo,
+        &["main", "--yes", "--no-remove", "--no-hooks"],
+        Some(&feature_wt),
+    );
+
+    // User hook should NOT have run (--no-hooks skips all hooks)
+    let marker_file = feature_wt.join("user_premerge_marker.txt");
+    assert!(
+        !marker_file.exists(),
+        "User pre-merge hook should be skipped with --no-hooks"
+    );
+}
+
+///
+/// Real Ctrl-C sends SIGINT to the entire foreground process group. We simulate this by:
+/// 1. Spawning wt in its own process group (so we don't kill the test runner)
+/// 2. Sending SIGINT to that process group (which includes wt and its hook children)
+#[rstest]
+#[cfg(unix)]
+fn test_pre_merge_hook_receives_sigint(repo: TestRepo) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.commit("Initial commit");
+
+    // Project pre-merge hook: write start, then sleep, then write done (if not interrupted)
+    repo.write_project_config(
+        r#"[pre-merge]
+long = "sh -c 'echo start >> hook.log; sleep 30; echo done >> hook.log'"
+"#,
+    );
+    repo.commit("Add pre-merge hook");
+
+    // Spawn wt in its own process group (so SIGINT to that group doesn't kill the test)
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.args(["hook", "pre-merge", "--yes"]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.process_group(0); // wt becomes leader of its own process group
+    let mut child = cmd.spawn().expect("failed to spawn wt hook pre-merge");
+
+    // Wait until hook writes "start" to hook.log (verifies the hook is running)
+    let hook_log = repo.root_path().join("hook.log");
+    wait_for_file_content(&hook_log);
+
+    // Send SIGINT to wt's process group (wt's PID == its PGID since it's the leader)
+    // This simulates real Ctrl-C which sends SIGINT to the foreground process group
+    let wt_pgid = Pid::from_raw(child.id() as i32);
+    kill(Pid::from_raw(-wt_pgid.as_raw()), Signal::SIGINT).expect("failed to send SIGINT to pgrp");
+
+    let status = child.wait().expect("failed to wait for wt");
+
+    // wt was killed by signal, so code() returns None and we check the signal
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.signal() == Some(2) || status.code() == Some(130),
+        "wt should be killed by SIGINT (signal 2) or exit 130, got: {status:?}"
+    );
+
+    // Give the (killed) hook a moment; it must not append "done"
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let mut contents = String::new();
+    std::fs::File::open(&hook_log)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert!(
+        contents.trim() == "start",
+        "hook should not have reached 'done'; got: {contents:?}"
+    );
+}
+
+#[rstest]
+#[cfg(unix)]
+fn test_pre_merge_hook_receives_sigterm(repo: TestRepo) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.commit("Initial commit");
+
+    // Project pre-merge hook: write start, then sleep, then write done (if not interrupted)
+    repo.write_project_config(
+        r#"[pre-merge]
+long = "sh -c 'echo start >> hook.log; sleep 30; echo done >> hook.log'"
+"#,
+    );
+    repo.commit("Add pre-merge hook");
+
+    // Spawn wt in its own process group (so SIGTERM to that group doesn't kill the test)
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.args(["hook", "pre-merge", "--yes"]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.process_group(0); // wt becomes leader of its own process group
+    let mut child = cmd.spawn().expect("failed to spawn wt hook pre-merge");
+
+    // Wait until hook writes "start" to hook.log (verifies the hook is running)
+    let hook_log = repo.root_path().join("hook.log");
+    wait_for_file_content(&hook_log);
+
+    // Send SIGTERM to wt's process group (wt's PID == its PGID since it's the leader)
+    let wt_pgid = Pid::from_raw(child.id() as i32);
+    kill(Pid::from_raw(-wt_pgid.as_raw()), Signal::SIGTERM)
+        .expect("failed to send SIGTERM to pgrp");
+
+    let status = child.wait().expect("failed to wait for wt");
+
+    // wt was killed by signal, so code() returns None and we check the signal
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.signal() == Some(15) || status.code() == Some(143),
+        "wt should be killed by SIGTERM (signal 15) or exit 143, got: {status:?}"
+    );
+
+    // Give the (killed) hook a moment; it must not append "done"
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let mut contents = String::new();
+    std::fs::File::open(&hook_log)
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert!(
+        contents.trim() == "start",
+        "hook should not have reached 'done'; got: {contents:?}"
+    );
+}
+
+/// A signal-derived exit in one hook step must abort the rest of the pipeline
+/// rather than treating the signal like an ordinary per-step failure. Drives
+/// the `handle_command_error` interrupt branch end-to-end through the hook
+/// path (the for-each test in `for_each.rs` covers the worktree-loop branch).
+///
+/// Implementation mirrors `test_for_each_aborts_on_signal_exit`: the first
+/// hook step self-signals via SIGTERM after touching a marker. SIGINT against
+/// the parent wt would kill the test harness, so we drive the same
+/// `ChildProcessExited { physical_signal: Some(_), .. }` path with an in-child signal.
+#[rstest]
+#[cfg(unix)]
+fn test_pre_merge_pipeline_aborts_on_signal_exit(repo: TestRepo) {
+    repo.commit("Initial commit");
+
+    // Two pre-merge pipeline steps: the first writes a marker then
+    // self-signals with SIGTERM; the second (which must NOT run) would write
+    // its own marker.
+    repo.write_project_config(
+        r#"pre-merge = [
+    { abort = "sh -c 'echo first >> hook.log; kill -TERM $$'" },
+    { after = "sh -c 'echo second >> hook.log'" },
+]
+"#,
+    );
+    repo.commit("Add pre-merge hooks");
+
+    let output = crate::common::wt_command()
+        .current_dir(repo.root_path())
+        .args(["hook", "pre-merge", "--yes"])
+        .output()
+        .expect("run wt hook pre-merge");
+
+    // 128 + SIGTERM (15) = 143
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(143),
+        "expected exit 143 (SIGTERM); got {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let hook_log = repo.root_path().join("hook.log");
+    let contents = std::fs::read_to_string(&hook_log).unwrap_or_default();
+    assert_eq!(
+        contents.trim(),
+        "first",
+        "second hook step ran after the first was killed by signal; got: {contents:?}",
+    );
+}
+
+/// Ctrl-C stops a Warn pipeline even when the step catches it and exits with an
+/// ordinary status: wt received the key itself, so the next step never starts.
+#[rstest]
+#[cfg(unix)]
+fn test_post_start_pipeline_stops_on_caught_ctrl_c(repo: TestRepo) {
+    repo.write_project_config(
+        r#"post-start = [
+    "trap 'exit 130' INT; echo $$ > hook-pid; while :; do sleep 0.1; done",
+    "echo after > after.log",
+]
+"#,
+    );
+    repo.commit("Add post-start pipeline");
+    let mut job = crate::common::SignalJob::spawn(
+        &repo,
+        &["-vv", "hook", "post-start", "--yes", "--foreground"],
+        std::process::Stdio::null(),
+    );
+    job.interrupt_admitted_child(&repo, &repo.root_path().join("hook-pid"));
+    assert_eq!(crate::common::shell_exit_code(&job.wait()), Some(130));
+    assert!(
+        !repo.root_path().join("after.log").exists(),
+        "the step after Ctrl-C must not run"
+    );
+}
+
+// ============================================================================
+// User Post-Merge Hook Tests
+// ============================================================================
+
+#[rstest]
+fn test_user_post_merge_hook_executes(mut repo: TestRepo) {
+    // Create feature worktree with a commit
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Write user config with post-merge hook
+    repo.write_test_config(
+        r#"[post-merge]
+notify = "echo 'USER_POST_MERGE_RAN' > user_postmerge.txt"
+"#,
+    );
+
+    snapshot_merge(
+        "user_post_merge_executes",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+
+    // Post-merge runs in the destination (main) worktree (poll for pipeline runner)
+    let main_worktree = repo.root_path();
+    let marker_file = main_worktree.join("user_postmerge.txt");
+    wait_for_file(&marker_file);
+}
+
+#[rstest]
+fn test_combined_user_and_project_post_merge(mut repo: TestRepo) {
+    repo.write_project_config(
+        r#"[post-merge]
+install = "echo 'PROJECT_RAN' > project_postmerge.txt"
+"#,
+    );
+    repo.commit("Add project config");
+
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    repo.write_test_config(
+        r#"[post-merge]
+sync = "echo 'USER_RAN' > user_postmerge.txt"
+"#,
+    );
+
+    snapshot_merge(
+        "combined_user_and_project_post_merge",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+
+    let main_worktree = repo.root_path();
+    wait_for_file(&main_worktree.join("user_postmerge.txt"));
+    wait_for_file(&main_worktree.join("project_postmerge.txt"));
+}
+
+// ============================================================================
+// User Pre-Remove Hook Tests
+// ============================================================================
+
+/// Helper for remove snapshots
+fn snapshot_remove(test_name: &str, repo: &TestRepo, args: &[&str], cwd: Option<&std::path::Path>) {
+    let settings = setup_snapshot_settings(repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(repo, "remove", args, cwd);
+        assert_cmd_snapshot!(test_name, cmd);
+    });
+}
+
+#[rstest]
+fn test_user_pre_remove_hook_executes(mut repo: TestRepo) {
+    // Create a worktree to remove
+    let _feature_wt = repo.add_worktree("feature");
+
+    // Write user config with pre-remove hook
+    // Hook writes to parent dir (temp dir) since the worktree itself gets removed
+    repo.write_test_config(
+        r#"[pre-remove]
+cleanup = "echo 'USER_PRE_REMOVE_RAN' > ../user_preremove_marker.txt"
+"#,
+    );
+
+    snapshot_remove(
+        "user_pre_remove_executes",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(repo.root_path()),
+    );
+
+    // Verify user hook ran (writes to parent dir since worktree is being removed)
+    let marker_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("user_preremove_marker.txt");
+    assert!(marker_file.exists(), "User pre-remove hook should have run");
+}
+
+#[rstest]
+fn test_user_pre_remove_failure_blocks_removal(mut repo: TestRepo) {
+    // Create a worktree to remove
+    let feature_wt = repo.add_worktree("feature");
+
+    // Write user config with failing pre-remove hook
+    repo.write_test_config(
+        r#"[pre-remove]
+block = "exit 1"
+"#,
+    );
+
+    snapshot_remove(
+        "user_pre_remove_failure",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(repo.root_path()),
+    );
+
+    // Worktree should still exist (removal blocked by failing hook)
+    assert!(
+        feature_wt.exists(),
+        "Worktree should not be removed when pre-remove hook fails"
+    );
+}
+
+#[rstest]
+fn test_user_pre_remove_skipped_with_no_hooks(mut repo: TestRepo) {
+    // Create a worktree to remove
+    let feature_wt = repo.add_worktree("feature");
+
+    // Write user config with pre-remove hook that would block
+    repo.write_test_config(
+        r#"[pre-remove]
+block = "exit 1"
+"#,
+    );
+
+    // With --no-hooks, all hooks (including the failing one) should be skipped
+    snapshot_remove(
+        "user_pre_remove_skipped_no_hooks",
+        &repo,
+        &["feature", "--force-delete", "--no-hooks"],
+        Some(repo.root_path()),
+    );
+
+    // Worktree should be removed (hooks skipped)
+    // Background removal needs time to complete
+    let timeout = Duration::from_secs(5);
+    let poll_interval = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    while feature_wt.exists() && start.elapsed() < timeout {
+        thread::sleep(poll_interval);
+    }
+    assert!(
+        !feature_wt.exists(),
+        "Worktree should be removed when --no-hooks skips failing hook"
+    );
+}
+
+// ============================================================================
+// User Post-Remove Hook Tests
+// ============================================================================
+
+#[rstest]
+fn test_user_post_remove_hook_executes(mut repo: TestRepo) {
+    // Create a worktree to remove
+    let _feature_wt = repo.add_worktree("feature");
+
+    // Write user config with post-remove hook
+    // Hook writes to parent dir (temp dir) since the worktree itself is removed
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo 'USER_POST_REMOVE_RAN' > ../user_postremove_marker.txt"
+"#,
+    );
+
+    snapshot_remove(
+        "user_post_remove_executes",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(repo.root_path()),
+    );
+
+    // Wait for background hook to complete
+    let marker_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("user_postremove_marker.txt");
+    crate::common::wait_for_file(&marker_file);
+    assert!(
+        marker_file.exists(),
+        "User post-remove hook should have run"
+    );
+}
+
+/// Post-remove hooks run at the primary worktree, not cwd. When removing a
+/// non-current worktree from a linked worktree, the output should show `@ [path]`
+/// pointing to the primary worktree where hooks execute.
+#[rstest]
+fn test_post_remove_hooks_run_at_primary_worktree(mut repo: TestRepo) {
+    let _feature_wt = repo.add_worktree("feature");
+    let other_wt = repo.add_worktree("other");
+
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo done"
+"#,
+    );
+
+    // Remove feature from the "other" worktree (not primary)
+    snapshot_remove(
+        "post_remove_runs_at_primary",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(&other_wt),
+    );
+}
+
+/// Verify that post-remove hook template variables reference the removed worktree,
+/// not the worktree where the hook executes from.
+#[rstest]
+fn test_user_post_remove_template_vars_reference_removed_worktree(mut repo: TestRepo) {
+    // Create a worktree with a unique commit to verify commit capture
+    let feature_wt_path =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Get the commit SHA of the feature worktree BEFORE removal
+    let feature_commit = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&feature_wt_path)
+        .run()
+        .unwrap();
+    let feature_commit = String::from_utf8_lossy(&feature_commit.stdout);
+    let feature_commit = feature_commit.trim();
+    let feature_short_commit = &feature_commit[..7];
+
+    // Write user config that captures template variables to a file
+    // Hook writes to parent dir (temp dir) since the worktree itself is removed
+    repo.write_test_config(
+        r#"[post-remove]
+capture = "echo 'branch={{ branch }} worktree_path={{ worktree_path }} worktree_name={{ worktree_name }} commit={{ commit }} short_commit={{ short_commit }}' > ../postremove_vars.txt"
+"#,
+    );
+
+    // Run from main worktree, remove the feature worktree
+    repo.wt_command()
+        .args(["remove", "feature", "--force-delete", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    // Wait for background hook to complete
+    let vars_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("postremove_vars.txt");
+    crate::common::wait_for_file_content(&vars_file);
+
+    let content = std::fs::read_to_string(&vars_file).unwrap();
+
+    // Verify branch is the removed branch
+    assert!(
+        content.contains("branch=feature"),
+        "branch should be the removed branch 'feature', got: {content}"
+    );
+
+    // Extract worktree name for cross-platform comparison.
+    // Hooks run in Git Bash on Windows, which converts paths to MSYS2 format
+    // (/c/Users/... instead of C:\Users\... or C:/Users/...). Instead of trying
+    // to match exact path formats, verify the path ends with the worktree name.
+    let feature_wt_name = feature_wt_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // Verify worktree_path is the removed worktree's path (not the main worktree)
+    // The worktree_path in hook output should end with the worktree directory name
+    assert!(
+        content.contains(&format!("/{feature_wt_name} "))
+            || content.contains(&format!(r"\{feature_wt_name} ")),
+        "worktree_path should end with the removed worktree's name '{feature_wt_name}', got: {content}"
+    );
+
+    // Verify worktree_name is the removed worktree's directory name
+    assert!(
+        content.contains(&format!("worktree_name={feature_wt_name}")),
+        "worktree_name should be the removed worktree's name '{feature_wt_name}', got: {content}"
+    );
+
+    // Verify commit is the removed worktree's commit (not main worktree's commit)
+    assert!(
+        content.contains(&format!("commit={feature_commit}")),
+        "commit should be the removed worktree's commit '{feature_commit}', got: {content}"
+    );
+
+    // Verify short_commit is the first 7 chars of the removed worktree's commit
+    assert!(
+        content.contains(&format!("short_commit={feature_short_commit}")),
+        "short_commit should be '{feature_short_commit}', got: {content}"
+    );
+}
+
+/// A detached worktree is on no branch, so `post-remove` hooks see `branch`
+/// unset rather than the literal `HEAD` — the string git resolves as a ref,
+/// which made `git push origin --delete {{ branch }}` target the wrong thing
+/// (issue #4009). `post-remove` overrides `branch` through
+/// `PostRemoveContext::extra_vars`, which is applied after the base context, so
+/// it needs the same `None` the base context has.
+#[rstest]
+fn test_user_post_remove_branch_unset_in_detached_worktree(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+    repo.detach_head_in_worktree("feature");
+    let feature_wt_path = repo.worktree_path("feature");
+
+    // Guarded the way the hook docs prescribe for every optional variable.
+    repo.write_test_config(
+        r#"[post-remove]
+capture = "echo 'branch=[{% if branch %}{{ branch }}{% endif %}]' > ../postremove_detached.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args([
+            "remove",
+            feature_wt_path.to_str().unwrap(),
+            "--force",
+            "--yes",
+        ])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let vars_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("postremove_detached.txt");
+    crate::common::wait_for_file_content(&vars_file);
+
+    let content = std::fs::read_to_string(&vars_file).unwrap();
+    assert_eq!(
+        content.trim(),
+        "branch=[]",
+        "post-remove `branch` should be unset for a detached worktree, got: {content}"
+    );
+}
+
+/// `target` names the branch the user lands on after removal — the primary
+/// worktree's — so a detached primary leaves it unset for the same reason
+/// `branch` is unset above. Both halves of one removal have to agree: the
+/// `pre-remove` site builds its own extra vars, so it drifted to an empty
+/// string while `post-remove` omitted the key. `is defined` is what separates
+/// the two states — an empty string renders identically under
+/// `{% if target %}`, but it makes `wt -v` print `target = ` where the var was
+/// never supplied.
+#[rstest]
+fn test_user_remove_hooks_target_unset_with_detached_primary_worktree(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+    repo.detach_head();
+
+    repo.write_test_config(
+        r#"[pre-remove]
+capture = "echo 'target=[{% if target is defined %}defined:{{ target }}{% else %}unset{% endif %}]' > ../preremove_detached_target.txt"
+
+[post-remove]
+capture = "echo 'target=[{% if target is defined %}defined:{{ target }}{% else %}unset{% endif %}]' > ../postremove_detached_target.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["remove", "feature", "--force", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let parent = repo.root_path().parent().unwrap().to_path_buf();
+    for (hook, file) in [
+        ("pre-remove", "preremove_detached_target.txt"),
+        ("post-remove", "postremove_detached_target.txt"),
+    ] {
+        let vars_file = parent.join(file);
+        crate::common::wait_for_file_content(&vars_file);
+
+        let content = std::fs::read_to_string(&vars_file).unwrap();
+        assert_eq!(
+            content.trim(),
+            "target=[unset]",
+            "{hook} `target` should be unset when the primary worktree is detached, got: {content}"
+        );
+    }
+}
+
+#[rstest]
+fn test_user_post_remove_skipped_with_no_hooks(mut repo: TestRepo) {
+    // Create a worktree to remove
+    let feature_wt = repo.add_worktree("feature");
+
+    // Write user config with post-remove hook that creates a marker
+    repo.write_test_config(
+        r#"[post-remove]
+marker = "echo 'SHOULD_NOT_RUN' > ../no_hooks_postremove.txt"
+"#,
+    );
+
+    snapshot_remove(
+        "user_post_remove_no_hooks",
+        &repo,
+        &["feature", "--force-delete", "--no-hooks"],
+        Some(repo.root_path()),
+    );
+
+    // Worktree should be removed
+    let timeout = Duration::from_secs(5);
+    let poll_interval = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    while feature_wt.exists() && start.elapsed() < timeout {
+        thread::sleep(poll_interval);
+    }
+    assert!(
+        !feature_wt.exists(),
+        "Worktree should be removed with --no-hooks"
+    );
+
+    // Post-remove hook should NOT have run
+    let marker_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("no_hooks_postremove.txt");
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+    assert!(
+        !marker_file.exists(),
+        "Post-remove hook should be skipped when --no-hooks is used"
+    );
+}
+
+/// Verify that post-remove hooks run during `wt merge` (which removes the worktree).
+/// This tests the main production use case for post-remove hooks.
+#[rstest]
+fn test_user_post_remove_hook_runs_during_merge(mut repo: TestRepo) {
+    // Create feature worktree with a commit
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature content", "Add feature");
+
+    // Write user config with post-remove hook
+    // Hook writes to temp dir (parent of repo) since worktree is removed
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo 'POST_REMOVE_DURING_MERGE' > ../merge_postremove_marker.txt"
+"#,
+    );
+
+    // Run merge from feature worktree - this should trigger post-remove hooks
+    repo.wt_command()
+        .args(["merge", "main", "--yes"])
+        .current_dir(&feature_wt)
+        .output()
+        .unwrap();
+
+    // Wait for background hook to complete
+    let marker_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("merge_postremove_marker.txt");
+    crate::common::wait_for_file_content(&marker_file);
+
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert!(
+        contents.contains("POST_REMOVE_DURING_MERGE"),
+        "Post-remove hook should run during wt merge with expected content"
+    );
+}
+
+/// `wt merge` with removal fires post-remove, post-switch, and post-merge in
+/// sequence. They should share one `Running …` announce line so the user sees
+/// a single status line for the whole command, not three.
+#[rstest]
+fn test_merge_combines_post_remove_post_switch_post_merge(mut repo: TestRepo) {
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature", "Add feature");
+
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo removed"
+
+[post-switch]
+notify = "echo switched"
+
+[post-merge]
+sync = "echo merged"
+"#,
+    );
+
+    snapshot_merge(
+        "merge_combines_post_remove_post_switch_post_merge",
+        &repo,
+        &["main", "--yes"],
+        Some(&feature_wt),
+    );
+}
+
+/// `wt merge` (no squash) with uncommitted changes auto-commits via
+/// `CommitOptions::commit`, which threads the merge announcer through. The
+/// post-commit phase should join post-remove + post-switch + post-merge on
+/// one combined announce line — the non-squash sibling of
+/// [`test_merge_squash_combines_post_remove_post_switch_post_merge`].
+///
+/// The announce line is all this pins. The merge removes the worktree
+/// post-commit is anchored on, so that clause is a `Skipped post-commit` line
+/// instead — see
+/// [`test_merge_post_commit_runs_only_when_its_worktree_survives`].
+#[rstest]
+fn test_merge_auto_commit_combines_post_remove_post_switch_post_merge(mut repo: TestRepo) {
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature", "Add feature");
+    // Leave an uncommitted change so the merge auto-commits via
+    // CommitOptions::commit (the path that exercises the announcer Some arm).
+    std::fs::write(feature_wt.join("dirty.txt"), "uncommitted").unwrap();
+
+    repo.write_test_config(
+        r#"[post-commit]
+mark = "echo committed"
+
+[post-remove]
+cleanup = "echo removed"
+
+[post-switch]
+notify = "echo switched"
+
+[post-merge]
+sync = "echo merged"
+"#,
+    );
+
+    snapshot_merge(
+        "merge_auto_commit_combines_post_remove_post_switch_post_merge",
+        &repo,
+        &["main", "--yes", "--no-squash"],
+        Some(&feature_wt),
+    );
+}
+
+/// `wt merge --squash` registers post-commit (from the squash phase),
+/// post-remove, post-switch (from worktree removal), and post-merge. The three
+/// that still have a worktree share one `Running …` announce line so the user
+/// sees a single status line for the whole command, not three.
+///
+/// That line is all this pins. The merge removes the worktree post-commit is
+/// anchored on, so that clause is a `Skipped post-commit` line instead — see
+/// [`test_merge_post_commit_runs_only_when_its_worktree_survives`].
+#[rstest]
+fn test_merge_squash_combines_post_remove_post_switch_post_merge(mut repo: TestRepo) {
+    // Squash needs >1 commit ahead of main to actually run.
+    let feature_wt = repo.add_worktree_with_commit("feature", "feature1.txt", "one", "feat: one");
+    repo.commit_in_worktree(&feature_wt, "feature2.txt", "two", "feat: two");
+
+    repo.write_test_config(
+        r#"[post-commit]
+mark = "echo committed"
+
+[post-remove]
+cleanup = "echo removed"
+
+[post-switch]
+notify = "echo switched"
+
+[post-merge]
+sync = "echo merged"
+"#,
+    );
+
+    snapshot_merge(
+        "merge_squash_combines_post_remove_post_switch_post_merge",
+        &repo,
+        &["main", "--yes", "--squash"],
+        Some(&feature_wt),
+    );
+}
+
+/// `post-commit` is anchored on the worktree the commit was made in, and a
+/// `wt merge` that removes that worktree reaches the announcer's flush with
+/// the anchor already renamed into `.git/wt/trash/`. `run_hooks_background`
+/// drops such a pipeline rather than spawn it: the runner would open the
+/// repository by discovery from an emptied path, which for a worktree nested
+/// inside its repository resolves to the **primary** worktree and runs the
+/// project's commands there.
+///
+/// The worktree is nested here so that a regression executes rather than
+/// merely fails — `git rev-parse --show-toplevel` would answer with the
+/// primary worktree and write the marker. `--no-remove` is the control: the
+/// same hook, config, and marker path, with the worktree kept.
+#[rstest]
+#[case::removed("removed", &["main", "--yes"], false)]
+#[case::kept("kept", &["main", "--yes", "--no-remove"], true)]
+fn test_merge_post_commit_runs_only_when_its_worktree_survives(
+    repo: TestRepo,
+    #[case] label: &str,
+    #[case] args: &[&str],
+    #[case] expect_ran: bool,
+) {
+    // A worktree inside the repository, so a pipeline spawned into its emptied
+    // path would find the primary worktree one level up.
+    let nested = repo.path().join(".worktrees").join("feature");
+    repo.run_git(&["worktree", "add", "-b", "feature", &nested.to_slash_lossy()]);
+    fs::write(nested.join("feature.txt"), "feature").unwrap();
+    repo.run_git_in(&nested, &["add", "feature.txt"]);
+    repo.run_git_in(&nested, &["commit", "-m", "Add feature"]);
+    // Uncommitted work so the merge squashes, which is what fires post-commit.
+    fs::write(nested.join("dirty.txt"), "uncommitted").unwrap();
+
+    // The marker lives in the primary worktree so it outlives the feature
+    // worktree, and records which worktree the hook resolved to.
+    repo.write_test_config(
+        r#"[post-commit]
+mark = "git rev-parse --show-toplevel > {{ repo_path }}/post-commit-toplevel.txt"
+"#,
+    );
+
+    let marker = repo.path().join("post-commit-toplevel.txt");
+    snapshot_merge(
+        &format!("merge_post_commit_worktree_{label}"),
+        &repo,
+        args,
+        Some(&nested),
+    );
+
+    if expect_ran {
+        wait_for_file_content(&marker);
+        let toplevel = fs::read_to_string(&marker).unwrap();
+        assert!(
+            toplevel.trim().ends_with(".worktrees/feature"),
+            "post-commit should resolve to the feature worktree, got: {toplevel}"
+        );
+    } else {
+        thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+        assert!(
+            !marker.exists(),
+            "post-commit ran with its worktree removed, resolving to {:?}",
+            fs::read_to_string(&marker).ok()
+        );
+    }
+}
+
+/// When post-merge template prep errors after post-remove + post-switch are
+/// already registered, the announcer's `Drop` impl flushes the pending hooks
+/// so they still spawn — preserving the prior fire-and-forget behavior in
+/// which earlier hooks couldn't be lost by a later failure.
+#[rstest]
+fn test_merge_drops_pending_hooks_when_post_merge_fails(mut repo: TestRepo) {
+    let feature_wt =
+        repo.add_worktree_with_commit("feature", "feature.txt", "feature", "Add feature");
+
+    let temp_root = repo.root_path().parent().unwrap();
+    let post_remove_marker = temp_root.join("drop_postremove_marker.txt");
+    let post_merge_marker = temp_root.join("drop_postmerge_marker.txt");
+
+    // post-merge has a template syntax error, so `register` errors after
+    // post-remove + post-switch are already pending in the announcer.
+    // (Semantic errors like undefined variables no longer fail prep — they
+    // surface when the runner renders the step; see
+    // test_background_hook_undefined_var_fails_in_runner.)
+    // Convert to forward slashes so the rendered shell command parses the same
+    // way under Windows Git Bash (where backslashes in unquoted paths get
+    // eaten as escape-of-next-char).
+    repo.write_test_config(&format!(
+        r#"[post-remove]
+cleanup = "echo POST_REMOVE_RAN > {}"
+
+[post-switch]
+notify = "echo switched"
+
+[post-merge]
+sync = "echo POST_MERGE_RAN > {} {{{{ bad..syntax }}}}"
+"#,
+        post_remove_marker.to_slash_lossy(),
+        post_merge_marker.to_slash_lossy(),
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["merge", "main", "--yes"])
+        .current_dir(&feature_wt)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "merge should fail when a post-merge template has a syntax error"
+    );
+
+    // Drop flushed the pending pipelines: post-remove ran despite the failure.
+    crate::common::wait_for_file_content(&post_remove_marker);
+    let contents = fs::read_to_string(&post_remove_marker).unwrap();
+    assert!(
+        contents.contains("POST_REMOVE_RAN"),
+        "post-remove should have spawned via Drop: {contents}"
+    );
+
+    // post-merge never registered (template prep failed), so its marker stays absent.
+    assert!(
+        !post_merge_marker.exists(),
+        "post-merge marker should not exist (template prep failed before spawn)"
+    );
+}
+
+/// A semantic template error (undefined variable) in a background hook does
+/// not fail the foreground command: templates render when each step runs, so
+/// the error surfaces in the detached runner and lands in its log. Only
+/// syntax errors abort at prep (see
+/// test_merge_drops_pending_hooks_when_post_merge_fails).
+#[rstest]
+fn test_background_hook_undefined_var_fails_in_runner(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[post-start]
+broken = "echo {{ does_not_exist }} > should_not_exist.txt"
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "background spawn should succeed; rendering fails later in the runner.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The runner renders the template, fails, and reports into its own log
+    // at `{branch}/{source}/{hook_type}/runner.log`.
+    let runner_log = resolve_git_common_dir(repo.root_path())
+        .join("wt/logs")
+        .join(worktrunk::path::sanitize_for_filename("main"))
+        .join("user")
+        .join("post-start")
+        .join("runner.log");
+    wait_for_file_content(&runner_log);
+    let log_content = fs::read_to_string(&runner_log).unwrap();
+    // Template errors identify the hook type, source, and command.
+    assert_snapshot!(log_content, @"
+    [31m✗[39m [31mFailed to expand post-start user:broken: undefined variable does_not_exist @ line 1[39m
+    [107m [0m echo {{ does_not_exist }} > should_not_exist.txt
+    [2m↳[22m [2mAvailable variables: [4margs[24m, [4mbase[24m, [4mbase_worktree_path[24m, [4mbranch[24m, [4mcommit[24m, [4mcwd[24m, [4mdefault_branch[24m, [4mhook_name[24m, [4mhook_type[24m, [4mprimary_worktree_path[24m, [4mremote[24m, [4mremote_url[24m, [4mrepo[24m, [4mrepo_path[24m, [4mshort_commit[24m, [4mtarget[24m, [4mtarget_worktree_path[24m, [4mupstream[24m, [4mworktree_name[24m, [4mworktree_path[24m[22m
+    ");
+
+    // The step never ran.
+    assert!(!repo.root_path().join("should_not_exist.txt").exists());
+}
+
+/// A later preparation error must reap already admitted concurrent children and
+/// resolve their traces before the background runner reports its failure.
+#[rstest]
+#[cfg(unix)]
+fn test_background_concurrent_template_failure_reaps_admitted_child(repo: TestRepo) {
+    use nix::fcntl::OFlag;
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{Pid, mkfifo};
+    use std::io::Write;
+    use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+    use std::process::{Child, Stdio};
+
+    struct Runner {
+        child: Child,
+        waited: bool,
+    }
+    impl Drop for Runner {
+        fn drop(&mut self) {
+            if !self.waited {
+                // The unreaped leader reserves this group ID, including when
+                // an assertion fails while the runner is blocked on the FIFO.
+                let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    let admitted = "printf '%s' $$ > admitted.pid; exec sleep 60";
+    let command = |name: &str, template: &str| {
+        serde_json::json!({
+            "name": name,
+            "template": template,
+            "context": {},
+            "template_name": HookSource::User.hook_label(worktrunk::HookType::PostCreate, Some(name)),
+            "label": HookSource::User.command_label(Some(name)),
+        })
+    };
+    let spec = serde_json::json!({
+        "worktree_path": repo.root_path(),
+        "branch": "main",
+        "hook_type": worktrunk::HookType::PostCreate,
+        "source": worktrunk::config::HookSource::User,
+        "steps": [{"Concurrent": [
+            command("admitted", admitted),
+            command("broken", "echo {{ does_not_exist }}"),
+        ]}],
+    });
+    let logs = resolve_git_common_dir(repo.root_path()).join("wt/logs");
+    let hook_logs = logs.join("main/user/post-start");
+    fs::create_dir_all(&hook_logs).unwrap();
+    let blocked_log = hook_logs.join("broken.log");
+    mkfifo(&blocked_log, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+    let runner_log = repo.root_path().join("runner-error.log");
+    let child = repo
+        .wt_command()
+        .args(["-vv", "hook", "run-pipeline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&runner_log).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut runner = Runner {
+        child,
+        waited: false,
+    };
+    runner
+        .child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .unwrap();
+
+    // Opening the second command's log blocks preparation until we have
+    // observed the first child's PID. The FIFO supplies ordering, not a delay.
+    let pid_path = repo.root_path().join("admitted.pid");
+    wait_for_file_content(&pid_path);
+    let pid = Pid::from_raw(fs::read_to_string(pid_path).unwrap().parse().unwrap());
+    kill(pid, None).expect("admitted child must still be running");
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NONBLOCK.bits())
+        .open(blocked_log)
+        .unwrap();
+
+    crate::common::wait_for("concurrent preparation failure", || {
+        fs::read_to_string(&runner_log)
+            .unwrap()
+            .contains("Failed to expand post-start user:broken:")
+    });
+    assert_eq!(kill(pid, None), Err(nix::errno::Errno::ESRCH));
+
+    let trace = fs::read_to_string(logs.join("trace.jsonl")).unwrap();
+    let outcomes: Vec<_> = worktrunk::trace::parse_lines(&trace)
+        .into_iter()
+        .filter(|entry| {
+            matches!(&entry.kind,
+            worktrunk::trace::TraceEntryKind::Command { command, .. } if command == admitted)
+        })
+        .map(|entry| entry.is_success())
+        .collect();
+    assert_eq!(outcomes, [false], "{trace}");
+    let status = runner.child.wait().unwrap();
+    runner.waited = true;
+    assert_eq!(status.code(), Some(1));
+}
+
+/// Filtered background hooks keep each source's execution and logs independent.
+#[rstest]
+#[case::user(HookSource::User)]
+#[case::project(HookSource::Project)]
+fn test_filtered_background_hooks_preserve_sources(
+    repo: TestRepo,
+    #[case] failing_source: HookSource,
+) {
+    let user_exit = if failing_source == HookSource::User {
+        "exit 7"
+    } else {
+        "true"
+    };
+    let project_exit = if failing_source == HookSource::Project {
+        "exit 7"
+    } else {
+        "true"
+    };
+    repo.write_test_config(&format!(
+        r#"[post-start]
+fmt = "echo USER_LOG; echo ran > user.txt; {user_exit}"
+"#
+    ));
+    repo.write_project_config(&format!(
+        r#"[post-start]
+fmt = "echo PROJECT_LOG; echo ran > project.txt; {project_exit}"
+"#
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "post-start", "fmt", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_file_content(&repo.root_path().join("user.txt"));
+    wait_for_file_content(&repo.root_path().join("project.txt"));
+
+    let logs = resolve_git_common_dir(repo.root_path()).join("wt/logs/main");
+    let runner = logs
+        .join(failing_source.to_string())
+        .join("post-start/runner.log");
+    crate::common::wait_for("source-qualified background failure", || {
+        fs::read_to_string(&runner)
+            .is_ok_and(|text| text.contains("failed (exit code 7)") && text.ends_with('\n'))
+    });
+    let user_log = fs::read_to_string(logs.join("user/post-start/fmt.log")).unwrap();
+    let project_log = fs::read_to_string(logs.join("project/post-start/fmt.log")).unwrap();
+    let failure = fs::read_to_string(runner).unwrap();
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_snapshot!(format!("filtered_background_sources_{failing_source}"), format!(
+            "announcement:\n{}\nuser/fmt.log:\n{user_log}\nproject/fmt.log:\n{project_log}\n{failing_source}/runner.log:\n{failure}",
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    });
+}
+
+/// Runner-log failures use the same hook/status grammar as foreground failures.
+#[rstest]
+fn test_background_hook_failure_labels_in_runner_log(repo: TestRepo) {
+    repo.write_test_config(
+        r#"post-start = [{ broken = "exit 7" }]
+post-switch = """
+true
+exit 9
+"""
+"#,
+    );
+
+    for hook_type in ["post-start", "post-switch"] {
+        let mut cmd = crate::common::wt_command();
+        cmd.current_dir(repo.root_path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+        cmd.args(["hook", hook_type, "--yes"]);
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "background spawn should succeed; the step fails later in the runner.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let runner_log = |hook_type: &str| {
+        resolve_git_common_dir(repo.root_path())
+            .join("wt/logs")
+            .join(worktrunk::path::sanitize_for_filename("main"))
+            .join("user")
+            .join(hook_type)
+            .join("runner.log")
+    };
+
+    let named = runner_log("post-start");
+    wait_for_file_content(&named);
+    assert_snapshot!(fs::read_to_string(&named).unwrap(), @"[31m✗[39m [31m[1mpost-start user:broken[22m failed (exit code 7)[39m");
+
+    let unnamed = runner_log("post-switch");
+    wait_for_file_content(&unnamed);
+    assert_snapshot!(fs::read_to_string(&unnamed).unwrap(), @"
+    [31m✗[39m [31m[1mpost-switch user hook[22m failed (exit code 9)[39m
+    [107m [0m [2m[0m[2m[34mtrue[0m
+    [107m [0m [2m[0m[2m[34mexit[0m[2m 9[0m
+    ");
+}
+
+/// A semantic template error in a foreground pipeline step surfaces when that
+/// step runs: earlier steps execute first, then the broken step's render
+/// aborts the pipeline. Syntax errors still abort before step 1.
+#[rstest]
+fn test_foreground_pipeline_undefined_var_runs_earlier_steps(repo: TestRepo) {
+    repo.write_test_config(
+        r#"pre-merge = [
+    { first = "echo FIRST_RAN > first_marker.txt" },
+    { broken = "echo {{ does_not_exist }}" },
+]
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-merge", "--yes"]);
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!("foreground_pipeline_undefined_var_runs_earlier_steps", cmd);
+    });
+
+    let marker = repo.root_path().join("first_marker.txt");
+    assert!(
+        marker.exists(),
+        "step 1 should have run before step 2's template error"
+    );
+}
+
+/// Runtime expansion obeys the same foreground policy as child failures:
+/// Warn admits healthy concurrent siblings and later commands from either
+/// source; FailFast rejects the group before spawning any command in it.
+#[rstest]
+#[case::warn_serial(true, false, true)]
+#[case::warn_concurrent(true, true, true)]
+#[case::warn_all_broken(true, true, false)]
+#[case::failfast_serial(false, false, true)]
+#[case::failfast_concurrent(false, true, true)]
+fn test_foreground_template_failure_policy(
+    repo: TestRepo,
+    #[case] warn: bool,
+    #[case] concurrent: bool,
+    #[case] healthy_sibling: bool,
+) {
+    let hook_type = if warn { "post-start" } else { "pre-merge" };
+    let broken = r#"broken = "echo {{ does_not_exist }}""#;
+    let sibling = if healthy_sibling {
+        r#"sibling = "echo ran > sibling.txt", "#
+    } else {
+        r#"also_broken = "echo {{ missing_too }}", "#
+    };
+    let failing_step = if concurrent {
+        format!("{{ {sibling}{broken} }}")
+    } else {
+        format!("{{ {broken} }}")
+    };
+    repo.write_test_config(&format!(
+        r#"{hook_type} = [
+    {{ first = "echo ran > first.txt" }},
+    {failing_step},
+    {{ later = "echo ran > later.txt" }},
+]
+"#,
+    ));
+    repo.write_project_config(&format!(
+        r#"[{hook_type}]
+project = "echo ran > project.txt"
+"#,
+    ));
+    let output = repo
+        .wt_command()
+        .args(["hook", hook_type, "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.success(), warn, "{stderr}");
+    assert!(repo.root_path().join("first.txt").exists(), "{stderr}");
+    for name in ["later.txt", "project.txt"] {
+        assert_eq!(
+            repo.root_path().join(name).exists(),
+            warn,
+            "{name}: {stderr}"
+        );
+    }
+    assert_eq!(
+        repo.root_path().join("sibling.txt").exists(),
+        warn && concurrent && healthy_sibling,
+        "{stderr}",
+    );
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_snapshot!(
+            format!("foreground_template_policy_{warn}_{concurrent}_{healthy_sibling}"),
+            stderr,
+        );
+    });
+}
+
+/// An ordinary shell status 130 remains a failure under Warn, so healthy
+/// concurrent siblings and subsequent source/serial commands still run.
+#[rstest]
+#[case::serial(false)]
+#[case::concurrent(true)]
+fn test_foreground_warn_status_130_continues(repo: TestRepo, #[case] concurrent: bool) {
+    let first = if concurrent {
+        r#"{ fail = "exit 130", sibling = "echo ran > sibling.txt" }"#
+    } else {
+        r#"{ fail = "exit 130" }"#
+    };
+    repo.write_test_config(&format!(
+        r#"post-start = [{first}, {{ later = "echo ran > later.txt" }}]
+"#,
+    ));
+    repo.write_project_config(
+        r#"[post-start]
+project = "echo ran > project.txt"
+"#,
+    );
+    let output = repo
+        .wt_command()
+        .args(["hook", "post-start", "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("failed (exit code 130)"), "{stderr}");
+    assert!(repo.root_path().join("later.txt").exists(), "{stderr}");
+    assert!(repo.root_path().join("project.txt").exists(), "{stderr}");
+    assert_eq!(repo.root_path().join("sibling.txt").exists(), concurrent);
+}
+
+#[rstest]
+fn test_hook_template_typo_names_variable(repo: TestRepo) {
+    repo.write_test_config("pre-merge = \"echo {{ brnch }}\"\n");
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = repo.wt_command();
+        cmd.args(["hook", "pre-merge", "--yes"]);
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// The other half of that contract: a *syntax* error anywhere in the pipeline
+/// aborts before step 1. Preparation parses every template
+/// (`PreparedPipeline::validated`), so a pipeline that can't render in full never
+/// starts — where a semantic error, rendered per step, lets earlier steps run.
+///
+/// Driven through `wt merge`'s pre-commit hooks rather than `wt hook
+/// pre-commit`, because the `wt hook` CLI parses every template up front to
+/// route shorthand arguments (`referenced_vars_union`) and would catch the
+/// error before preparation, leaving the preparation-time guard untested.
+#[rstest]
+fn test_foreground_pipeline_syntax_error_aborts_before_first_step(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+    fs::write(feature_wt.join("uncommitted.txt"), "uncommitted content").unwrap();
+
+    repo.write_test_config(
+        r#"pre-commit = [
+    { first = "echo FIRST_RAN > syntax_first_marker.txt" },
+    { broken = "echo {{ bad..syntax }}" },
+]
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["merge", "main", "--yes", "--no-remove"])
+        .current_dir(&feature_wt)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an unparsable template should fail the merge"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("syntax error"),
+        "error should name the syntax failure, got: {stderr}"
+    );
+    assert!(
+        !feature_wt.join("syntax_first_marker.txt").exists(),
+        "step 1 must not run when a later step's template can't parse: {stderr}"
+    );
+}
+
+/// When removing the current worktree (cd back to main), both post-remove and
+/// post-switch hooks fire. They should appear on a single combined announcement line.
+#[rstest]
+fn test_combined_post_remove_and_post_switch_hooks(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+
+    // Configure both post-remove and post-switch user hooks
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo removed"
+
+[post-switch]
+notify = "echo switched"
+"#,
+    );
+
+    // Remove from inside the feature worktree — triggers cd back to main,
+    // which means changed_directory=true and both hook types fire.
+    snapshot_remove(
+        "combined_post_remove_and_post_switch",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(&feature_wt),
+    );
+}
+
+/// Verbose variant of [`test_combined_post_remove_and_post_switch_hooks`].
+///
+/// Under `-v`, the announcer prints a `template variables:` table for each
+/// registered hook type, iterating over pipelines and skipping those whose
+/// hook type doesn't match — that filter branch needs at least two hook
+/// types in one batch to fire. Removing the current worktree's branch is
+/// the only path that registers both `post-remove` and `post-switch`.
+#[rstest]
+fn test_combined_post_remove_and_post_switch_hooks_verbose(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo removed"
+
+[post-switch]
+notify = "echo switched"
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd_with_global_flags(
+            &repo,
+            "remove",
+            &["feature", "--force-delete"],
+            Some(&feature_wt),
+            &["-v"],
+        );
+        assert_cmd_snapshot!("combined_post_remove_and_post_switch_verbose", cmd);
+    });
+}
+
+/// The approval gate freezes both removal hooks before either runs. If
+/// `pre-remove` makes the user config unreadable, `post-remove` must still run
+/// from that frozen plan rather than silently disappearing on a second load.
+#[rstest]
+fn test_post_remove_uses_config_snapshot_after_pre_remove_mutates_file(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+    let config_path = repo.test_config_path().to_slash_lossy();
+    let marker = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("post-remove-after-config-change.txt");
+    let marker_path = marker.to_slash_lossy();
+
+    repo.write_test_config(&format!(
+        r#"[pre-remove]
+break-config = "printf 'invalid = [' > '{config_path}'"
+
+[post-remove]
+marker = "printf POST_REMOVE_RAN > '{marker_path}'"
+"#
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--foreground", "--force-delete", "feature"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "removal should succeed after the planned pre-remove hook mutates config: {stderr}"
+    );
+    assert!(
+        !feature_wt.exists(),
+        "feature worktree should have been removed"
+    );
+    assert!(
+        stderr.contains("Running post-remove"),
+        "the frozen post-remove hook should still be registered: {stderr}"
+    );
+    wait_for_file_content(&marker);
+    assert_eq!(fs::read_to_string(marker).unwrap(), "POST_REMOVE_RAN");
+}
+
+/// Manual hook argument routing parses templates before pipeline preparation.
+/// Its syntax errors must identify the same source and command as execution
+/// errors, including which named command failed.
+#[rstest]
+#[case::user_unnamed(HookSource::User, None)]
+#[case::user_named(HookSource::User, Some("broken"))]
+#[case::project_unnamed(HookSource::Project, None)]
+#[case::project_named(HookSource::Project, Some("broken"))]
+fn test_standalone_hook_post_remove_invalid_template(
+    repo: TestRepo,
+    #[case] source: HookSource,
+    #[case] name: Option<&str>,
+) {
+    let config = match name {
+        Some(name) => format!(
+            r#"[post-remove]
+{name} = "echo {{{{ invalid"
+"#
+        ),
+        None => r#"post-remove = "echo {{ invalid""#.to_owned(),
+    };
+    match source {
+        HookSource::User => repo.write_test_config(&config),
+        HookSource::Project => repo.write_project_config(&config),
+    }
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["hook", "post-remove", "--yes"]);
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!(
+            format!(
+                "standalone_hook_post_remove_invalid_template_{source}_{}",
+                name.unwrap_or("unnamed")
+            ),
+            cmd
+        );
+    });
+}
+
+#[rstest]
+fn test_standalone_hook_post_remove_name_filter_no_match(repo: TestRepo) {
+    // Write project config with a named hook
+    repo.write_project_config(
+        r#"[post-remove]
+cleanup = "echo cleanup"
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    // Use a name filter that doesn't match any configured hook
+    cmd.args(["hook", "post-remove", "nonexistent", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "wt hook post-remove should fail when name filter doesn't match"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No hook named") || stderr.contains("nonexistent"),
+        "Error should mention the unmatched filter, got: {stderr}"
+    );
+}
+
+// ============================================================================
+// User Pre-Commit Hook Tests
+// ============================================================================
+
+#[rstest]
+fn test_user_pre_commit_hook_executes(mut repo: TestRepo) {
+    // Create feature worktree
+    let feature_wt = repo.add_worktree("feature");
+
+    // Add uncommitted changes (triggers pre-commit during merge)
+    fs::write(feature_wt.join("uncommitted.txt"), "uncommitted content").unwrap();
+
+    // Write user config with pre-commit hook
+    repo.write_test_config(
+        r#"[pre-commit]
+lint = "echo 'USER_PRE_COMMIT_RAN' > user_precommit.txt"
+"#,
+    );
+
+    snapshot_merge(
+        "user_pre_commit_executes",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+
+    // Verify user hook ran
+    let marker_file = feature_wt.join("user_precommit.txt");
+    assert!(marker_file.exists(), "User pre-commit hook should have run");
+}
+
+#[rstest]
+fn test_user_pre_commit_failure_blocks_commit(mut repo: TestRepo) {
+    // Create feature worktree
+    let feature_wt = repo.add_worktree("feature");
+
+    // Add uncommitted changes
+    fs::write(feature_wt.join("uncommitted.txt"), "uncommitted content").unwrap();
+
+    // Write user config with failing pre-commit hook
+    repo.write_test_config(
+        r#"[pre-commit]
+lint = "exit 1"
+"#,
+    );
+
+    // Failing pre-commit hook should block the merge
+    snapshot_merge(
+        "user_pre_commit_failure",
+        &repo,
+        &["main", "--yes", "--no-remove"],
+        Some(&feature_wt),
+    );
+}
+
+// ============================================================================
+// User Post-Commit Hook Tests (Background, via `wt step commit`)
+// ============================================================================
+
+/// Helper for step commit snapshots
+fn snapshot_step_commit(
+    test_name: &str,
+    repo: &TestRepo,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+) {
+    let settings = setup_snapshot_settings(repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(repo, "step", &[], cwd);
+        cmd.arg("commit");
+        cmd.args(args);
+        cmd.env(
+            "WORKTRUNK_COMMIT__GENERATION__COMMAND",
+            "cat >/dev/null && echo 'feat: test commit'",
+        );
+        assert_cmd_snapshot!(test_name, cmd);
+    });
+}
+
+#[rstest]
+fn test_user_post_commit_hook_executes(mut repo: TestRepo) {
+    // Create feature worktree with staged changes
+    let feature_wt = repo.add_worktree("feature");
+    fs::write(feature_wt.join("new_file.txt"), "content").unwrap();
+
+    // Write user config with post-commit hook
+    repo.write_test_config(
+        r#"[post-commit]
+notify = "echo 'USER_POST_COMMIT_RAN' > user_postcommit.txt"
+"#,
+    );
+
+    snapshot_step_commit("user_post_commit_executes", &repo, &[], Some(&feature_wt));
+
+    // Post-commit runs in background in the worktree where the commit happened
+    let marker_file = feature_wt.join("user_postcommit.txt");
+    wait_for_file_content(&marker_file);
+
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert!(
+        contents.contains("USER_POST_COMMIT_RAN"),
+        "User post-commit hook should have run, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_user_post_commit_skipped_with_no_hooks(mut repo: TestRepo) {
+    // Create feature worktree with staged changes
+    let feature_wt = repo.add_worktree("feature");
+    fs::write(feature_wt.join("new_file.txt"), "content").unwrap();
+
+    // Write user config with post-commit hook
+    repo.write_test_config(
+        r#"[post-commit]
+notify = "echo 'USER_POST_COMMIT_RAN' > user_postcommit.txt"
+"#,
+    );
+
+    snapshot_step_commit(
+        "user_post_commit_skipped_no_hooks",
+        &repo,
+        &["--no-hooks"],
+        Some(&feature_wt),
+    );
+
+    // Wait to ensure background hook would have had time to run
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let marker_file = feature_wt.join("user_postcommit.txt");
+    assert!(
+        !marker_file.exists(),
+        "User post-commit hook should be skipped with --no-hooks"
+    );
+}
+
+#[rstest]
+fn test_user_post_commit_failure_does_not_block_commit(mut repo: TestRepo) {
+    // Create feature worktree with staged changes
+    let feature_wt = repo.add_worktree("feature");
+    fs::write(feature_wt.join("new_file.txt"), "content").unwrap();
+
+    // Write user config with failing post-commit hook
+    repo.write_test_config(
+        r#"[post-commit]
+failing = "exit 1"
+"#,
+    );
+
+    snapshot_step_commit("user_post_commit_failure", &repo, &[], Some(&feature_wt));
+
+    // The commit should have succeeded despite post-commit hook failure
+    // (post-commit runs in background and doesn't affect exit code)
+    let output = repo
+        .git_command()
+        .current_dir(&feature_wt)
+        .args(["log", "--oneline", "-1"])
+        .run()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("feat: test commit"),
+        "Commit should have succeeded despite post-commit hook failure, got: {stdout}"
+    );
+}
+
+// ============================================================================
+// Template Variable Tests
+// ============================================================================
+
+#[rstest]
+fn test_user_hook_template_variables(repo: TestRepo) {
+    // Write user config with hook using template variables
+    repo.write_test_config(
+        r#"[pre-start]
+vars = "echo 'repo={{ repo }} branch={{ branch }}' > template_vars.txt"
+"#,
+    );
+
+    snapshot_switch("user_hook_template_vars", &repo, &["--create", "feature"]);
+
+    // Verify template variables were expanded
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let vars_file = worktree_path.join("template_vars.txt");
+    assert!(vars_file.exists());
+
+    let contents = fs::read_to_string(&vars_file).unwrap();
+    assert!(
+        contents.contains("repo=repo"),
+        "Should have expanded repo variable: {}",
+        contents
+    );
+    assert!(
+        contents.contains("branch=feature"),
+        "Should have expanded branch variable: {}",
+        contents
+    );
+}
+
+#[rstest]
+fn test_hook_template_variables_from_subdirectory(repo: TestRepo) {
+    // Hook that writes template variables and pwd to files so we can verify their values.
+    // This tests that running from a subdirectory still resolves worktree_path to the
+    // worktree root (not "." or the subdirectory) and sets hook CWD to the root.
+    repo.write_project_config(
+        r#"pre-merge = "echo '{{ worktree_path }}' > wt_path.txt && echo '{{ worktree_name }}' > wt_name.txt && pwd > hook_cwd.txt""#,
+    );
+    repo.commit("Add pre-merge hook");
+
+    // Create a subdirectory and run the hook from there
+    let subdir = repo.root_path().join("src").join("components");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", "--yes"])
+        .current_dir(&subdir) // override: run from subdirectory
+        .output()
+        .expect("Failed to run wt hook pre-merge");
+
+    assert!(
+        output.status.success(),
+        "wt hook pre-merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // worktree_path should be the worktree root, not "." or the subdirectory.
+    // On Windows, to_posix_path() converts C:\... to /c/..., so check that the path
+    // is not relative rather than using is_absolute() (which rejects POSIX-style paths).
+    let wt_path = fs::read_to_string(repo.root_path().join("wt_path.txt"))
+        .expect("wt_path.txt should exist (hook should run from worktree root, not subdirectory)");
+    let wt_path = wt_path.trim();
+    assert_ne!(wt_path, ".", "worktree_path should not be relative '.'");
+    assert!(
+        wt_path.ends_with("repo"),
+        "worktree_path should end with repo dir name, got: {wt_path}"
+    );
+
+    // worktree_name should be the directory name, not "unknown"
+    let wt_name =
+        fs::read_to_string(repo.root_path().join("wt_name.txt")).expect("wt_name.txt should exist");
+    assert_eq!(
+        wt_name.trim(),
+        "repo",
+        "worktree_name should be the directory name, not 'unknown'"
+    );
+
+    // Hook CWD should be the worktree root, not the subdirectory
+    let hook_cwd = fs::read_to_string(repo.root_path().join("hook_cwd.txt"))
+        .expect("hook_cwd.txt should exist");
+    let hook_cwd = hook_cwd.trim();
+    assert!(
+        !hook_cwd.contains("src/components"),
+        "Hook should run from worktree root, not subdirectory. CWD was: {hook_cwd}"
+    );
+    assert!(
+        hook_cwd.ends_with("repo"),
+        "Hook CWD should be worktree root, got: {hook_cwd}"
+    );
+}
+
+// ============================================================================
+// Combined User and Project Hooks Tests
+// ============================================================================
+
+/// Test that both user and project unnamed hooks of the same type run and get unique log names.
+/// This exercises the unnamed index tracking when multiple unnamed hooks share the same hook type.
+#[rstest]
+fn test_user_and_project_unnamed_post_start(repo: TestRepo) {
+    // Create project config with unnamed post-start hook
+    repo.write_project_config(r#"post-start = "echo 'PROJECT_POST_START' > project_bg.txt""#);
+    repo.commit("Add project config");
+
+    // Write user config with unnamed hook AND pre-approve project command
+    repo.write_test_config(
+        r#"post-start = "echo 'USER_POST_START' > user_bg.txt"
+"#,
+    );
+    repo.write_test_approvals(
+        r#"[projects."../origin"]
+approved-commands = ["echo 'PROJECT_POST_START' > project_bg.txt"]
+"#,
+    );
+
+    snapshot_switch(
+        "user_and_project_unnamed_post_start",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    // Wait for both background commands
+    wait_for_file(&worktree_path.join("user_bg.txt"));
+    wait_for_file(&worktree_path.join("project_bg.txt"));
+
+    // Both should have run
+    assert!(
+        worktree_path.join("user_bg.txt").exists(),
+        "User post-start should have run"
+    );
+    assert!(
+        worktree_path.join("project_bg.txt").exists(),
+        "Project post-start should have run"
+    );
+}
+
+#[rstest]
+fn test_user_and_project_post_start_both_run(repo: TestRepo) {
+    // Create project config with post-start hook
+    repo.write_project_config(r#"post-start = "echo 'PROJECT_POST_START' > project_bg.txt""#);
+    repo.commit("Add project config");
+
+    // Write user config with user hook AND pre-approve project command
+    repo.write_test_config(
+        r#"[post-start]
+bg = "echo 'USER_POST_START' > user_bg.txt"
+"#,
+    );
+    repo.write_test_approvals(
+        r#"[projects."../origin"]
+approved-commands = ["echo 'PROJECT_POST_START' > project_bg.txt"]
+"#,
+    );
+
+    snapshot_switch(
+        "user_and_project_post_start",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    // Wait for both background commands
+    wait_for_file(&worktree_path.join("user_bg.txt"));
+    wait_for_file(&worktree_path.join("project_bg.txt"));
+
+    // Both should have run
+    assert!(
+        worktree_path.join("user_bg.txt").exists(),
+        "User post-start should have run"
+    );
+    assert!(
+        worktree_path.join("project_bg.txt").exists(),
+        "Project post-start should have run"
+    );
+}
+
+// ============================================================================
+// Standalone Hook Execution Tests (wt hook <type>)
+// ============================================================================
+
+#[rstest]
+fn test_standalone_hook_failure_omits_skip_hint(repo: TestRepo) {
+    // `wt hook <type>` is the user explicitly requesting hooks. When a hook
+    // fails, suggesting `--no-hooks` makes no sense (they didn't ask for the
+    // operation that runs hooks; they asked for the hooks themselves). The
+    // hint must be reserved for operation-driven hooks (merge, commit, ...).
+    repo.write_project_config(r#"pre-merge = "exit 1""#);
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["hook", "pre-merge", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "wt hook pre-merge should fail when hook exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--no-hooks"),
+        "wt hook <type> failure must not suggest --no-hooks; got: {stderr}"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_pre_start(repo: TestRepo) {
+    // Write project config with pre-start hook
+    repo.write_project_config(r#"pre-start = "echo 'STANDALONE_PRE_CREATE' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt hook pre-start should succeed");
+
+    let marker = repo.root_path().join("hook_ran.txt");
+    crate::common::wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_PRE_CREATE"));
+}
+
+#[rstest]
+fn test_standalone_hook_create_alias_runs_silently(repo: TestRepo) {
+    // `wt hook pre-create` is a deprecated alias for `wt hook pre-start`. It
+    // still runs the canonical `pre-start` hook, and Phase 1 of the rename
+    // emits no warning (issue #2838).
+    repo.write_project_config(r#"pre-start = "echo 'CREATE_ALIAS' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-create", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook pre-create should succeed (alias for pre-start)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.to_lowercase().contains("deprecated"),
+        "phase 1 emits no deprecation warning, got: {stderr}"
+    );
+
+    // Verify the aliased hook actually ran.
+    let marker = repo.root_path().join("hook_ran.txt");
+    crate::common::wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("CREATE_ALIAS"));
+}
+
+#[rstest]
+fn test_standalone_hook_pre_start_fails_on_failure(repo: TestRepo) {
+    // pre-start hooks use FailFast like all other pre-* hooks — consistent with
+    // the symmetric pre (blocking, fail-fast) / post (background, warn) pattern.
+    repo.write_project_config(r#"pre-start = "exit 1""#);
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "wt hook pre-start should exit non-zero when the hook fails (fail-fast, like all pre-* hooks)"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_post_start(repo: TestRepo) {
+    // Write project config with post-start hook
+    repo.write_project_config(r#"post-start = "echo 'STANDALONE_POST_START' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt hook post-start should succeed");
+
+    // Hook spawns in background - wait for marker file
+    let marker = repo.root_path().join("hook_ran.txt");
+    wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_POST_START"));
+}
+
+#[rstest]
+fn test_standalone_hook_post_start_foreground(repo: TestRepo) {
+    // Write project config with post-start hook that echoes to both file and stdout
+    repo.write_project_config(
+        r#"post-start = "echo 'FOREGROUND_POST_START' && echo 'marker' > hook_ran.txt""#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed"
+    );
+
+    // With --foreground, marker file should exist immediately (no waiting)
+    let marker = repo.root_path().join("hook_ran.txt");
+    assert!(
+        marker.exists(),
+        "hook should have completed synchronously with --foreground"
+    );
+
+    // Output should contain the hook's stdout (not just spawned message)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FOREGROUND_POST_START"),
+        "hook stdout should appear in command output with --foreground, got: {stderr}"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_post_start_foreground_inherits_stdin(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // `--foreground` routes a `post-*` hook through the single-step foreground
+    // path, which inherits wt's stdin — so the hook can prompt in the mode that
+    // exists to debug it. (The detached default reads EOF; see
+    // `test_post_start_detached_hook_gets_no_stdin`.)
+    repo.write_project_config(r#"post-start = "cat > captured.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = repo.root_path().join("captured.txt");
+    assert!(
+        captured.exists(),
+        "captured.txt should have been created from the inherited stdin"
+    );
+
+    let contents = fs::read_to_string(&captured).unwrap();
+    assert_eq!(
+        contents, "sentinel-from-parent-stdin\n",
+        "`--foreground` should hand the hook the parent's raw stdin"
+    );
+}
+
+/// Foreground children share the caller's native job group.
+#[rstest]
+#[cfg(unix)]
+fn test_pre_start_hook_shares_parent_pgroup(repo: TestRepo) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    repo.write_project_config(r#"pre-start = "ps -o pgid= -p $$ | tr -d ' \n' > hook_pgid.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-start", "--yes"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // wt becomes its own pgroup leader, so wt.pid == wt.pgid.
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("failed to spawn wt hook pre-start");
+    let wt_pid = child.id() as i32;
+    let status = child.wait().expect("failed to wait for wt");
+    assert!(status.success(), "hook should succeed, got: {status:?}");
+
+    let marker = repo.root_path().join("hook_pgid.txt");
+    let recorded = fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("missing pgid marker {marker:?}: {e}"));
+    let hook_pgid: i32 = recorded
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse pgid {recorded:?}: {e}"));
+    assert_eq!(
+        hook_pgid, wt_pid,
+        "foreground hook must share its caller group"
+    );
+}
+
+#[rstest]
+fn test_foreground_pipeline_steps_share_one_stdin(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Foreground steps run in order against wt's own stdin, so the first one
+    // to drain it to EOF leaves nothing behind — which is a property of the
+    // pipe this test constructs, not of a terminal, where each step could
+    // still prompt in turn. Steps accumulate across config files, so a user
+    // and a project hook of the same type reach this shape without an array.
+    repo.write_project_config(r#"post-start = ["cat > a.txt", "cat > b.txt"]"#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("a.txt")).unwrap(),
+        "sentinel-from-parent-stdin\n",
+        "the first foreground step should read the parent's stdin"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("b.txt")).unwrap(),
+        "",
+        "the first step drained stdin, so the second should see EOF"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_concurrent_group_gets_no_stdin_under_foreground(repo: TestRepo) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // A multi-key table parses as `HookStep::Concurrent`, whose children run at
+    // the same time and so can't share one terminal — each gets a closed stdin
+    // instead. This is the shape that silently takes the tty away from a
+    // `gum confirm`, so pin it rather than leaving it to the docs.
+    repo.write_project_config(
+        r#"[post-start]
+a = "cat > cap_a.txt"
+b = "true"
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn wt hook post-start");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(b"sentinel-from-parent-stdin\n")
+        .expect("failed to write to wt stdin");
+    let output = child.wait_with_output().expect("failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "wt hook post-start --foreground should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("cap_a.txt")).unwrap();
+    assert_eq!(
+        contents, "",
+        "a concurrent child should read EOF — neither the parent's stdin nor a JSON context"
+    );
+}
+
+#[rstest]
+fn test_standalone_hook_pre_commit(repo: TestRepo) {
+    // Write project config with pre-commit hook
+    repo.write_project_config(r#"pre-commit = "echo 'STANDALONE_PRE_COMMIT' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-commit", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt hook pre-commit should succeed");
+
+    // Hook should have run
+    let marker = repo.root_path().join("hook_ran.txt");
+    assert!(marker.exists(), "pre-commit hook should have run");
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_PRE_COMMIT"));
+}
+
+#[rstest]
+fn test_standalone_hook_post_merge(repo: TestRepo) {
+    // Write project config with post-merge hook
+    repo.write_project_config(r#"post-merge = "echo 'STANDALONE_POST_MERGE' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-merge", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt hook post-merge should succeed");
+
+    // Hook runs in background — wait for it to write the marker file
+    let marker = repo.root_path().join("hook_ran.txt");
+    crate::common::wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_POST_MERGE"));
+}
+
+#[rstest]
+fn test_standalone_hook_post_merge_combined_user_and_project(repo: TestRepo) {
+    // Both user and project configs contribute to post-merge — a single
+    // `Running post-merge:` announce line must cover both sources.
+    repo.write_project_config(r#"post-merge = "echo 'PROJECT_RAN' > project.txt""#);
+    repo.write_test_config(
+        r#"[post-merge]
+notify = "echo 'USER_RAN' > user.txt"
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(&repo, "hook", &["post-merge", "--yes"], None);
+        assert_cmd_snapshot!("standalone_hook_post_merge_combined_sources", cmd);
+    });
+
+    let root = repo.root_path();
+    wait_for_file(&root.join("user.txt"));
+    wait_for_file(&root.join("project.txt"));
+}
+
+#[rstest]
+fn test_standalone_hook_pre_remove(repo: TestRepo) {
+    // Write project config with pre-remove hook
+    repo.write_project_config(r#"pre-remove = "echo 'STANDALONE_PRE_REMOVE' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-remove", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt hook pre-remove should succeed");
+
+    // Hook should have run
+    let marker = repo.root_path().join("hook_ran.txt");
+    assert!(marker.exists(), "pre-remove hook should have run");
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_PRE_REMOVE"));
+}
+
+#[rstest]
+fn test_standalone_hook_post_remove(repo: TestRepo) {
+    // Write project config with post-remove hook
+    repo.write_project_config(r#"post-remove = "echo 'STANDALONE_POST_REMOVE' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-remove", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-remove should succeed (spawns in background)"
+    );
+
+    // Wait for background hook to complete and write content
+    let marker = repo.root_path().join("hook_ran.txt");
+    crate::common::wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("STANDALONE_POST_REMOVE"));
+}
+
+#[rstest]
+fn test_standalone_hook_post_remove_foreground(repo: TestRepo) {
+    // Write project config with post-remove hook
+    repo.write_project_config(r#"post-remove = "echo 'FOREGROUND_POST_REMOVE' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-remove", "--yes", "--foreground"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-remove --foreground should succeed"
+    );
+
+    // Hook runs in foreground, so marker should exist immediately
+    let marker = repo.root_path().join("hook_ran.txt");
+    assert!(marker.exists(), "post-remove hook should have run");
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("FOREGROUND_POST_REMOVE"));
+}
+
+#[rstest]
+fn test_standalone_hook_no_hooks_configured(repo: TestRepo) {
+    // No project config, no user config with hooks: `wt hook` should exit 0
+    // with a warning — running hooks that don't exist is a no-op, not an error.
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook should exit 0 when no hooks configured, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No pre-start hooks configured"),
+        "stderr should warn about missing hooks, got: {stderr}"
+    );
+}
+
+// ============================================================================
+// Dry-Run Tests
+// ============================================================================
+
+/// --dry-run shows expanded commands without executing them
+#[rstest]
+fn test_hook_dry_run_shows_expanded_command(repo: TestRepo) {
+    repo.write_project_config(r#"pre-merge = "echo branch={{ branch }}""#);
+
+    let settings = setup_snapshot_settings(&repo);
+    let _guard = settings.bind_to_scope();
+
+    // No --yes needed: --dry-run skips approval
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "hook",
+        &["pre-merge", "--dry-run"],
+        Some(repo.root_path()),
+    ));
+}
+
+/// --dry-run does not execute the hook command
+#[rstest]
+fn test_hook_dry_run_does_not_execute(repo: TestRepo) {
+    repo.write_project_config(r#"pre-start = "echo 'SHOULD_NOT_RUN' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "pre-start", "--dry-run"]);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "dry-run should succeed");
+
+    // Hook should NOT have run
+    let marker = repo.root_path().join("hook_ran.txt");
+    assert!(
+        !marker.exists(),
+        "dry-run should not execute the hook command"
+    );
+}
+
+/// --dry-run shows named hooks with source:name labels
+#[rstest]
+fn test_hook_dry_run_named_hooks(repo: TestRepo) {
+    repo.write_project_config(
+        r#"pre-merge = [
+    {lint = "pre-commit run --all-files"},
+    {test = "cargo test"},
+]
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    let _guard = settings.bind_to_scope();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "hook",
+        &["pre-merge", "--dry-run"],
+        Some(repo.root_path()),
+    ));
+}
+
+// ============================================================================
+// Background Hook Execution Tests (post-start, post-switch)
+// ============================================================================
+
+#[rstest]
+fn test_concurrent_hook_single_failure(repo: TestRepo) {
+    // Write project config with a hook that writes output before failing
+    repo.write_project_config(r#"post-start = "echo HOOK_OUTPUT_MARKER; exit 1""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    // Background spawning always succeeds (spawn succeeded, failure is logged)
+    assert!(
+        output.status.success(),
+        "wt hook post-start should succeed (spawns in background)"
+    );
+
+    // Wait for log files: runner log + per-command log (cmd-0, unnamed single command)
+    let log_dir = resolve_git_common_dir(repo.root_path()).join("wt/logs");
+    wait_for_file_count(&log_dir, "log", 2);
+
+    // Hook logs live at `{branch}/project/post-start/{name}.log`.
+    let post_start_dir = log_dir
+        .join(worktrunk::path::sanitize_for_filename("main"))
+        .join("project")
+        .join("post-start");
+    let cmd_log = fs::read_dir(&post_start_dir)
+        .unwrap_or_else(|e| panic!("reading {post_start_dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().contains("cmd-0"))
+        .expect("Should have a cmd-0 log file");
+
+    // Wait for content to be written (command runs async)
+    wait_for_file_content(&cmd_log.path());
+    let log_content = fs::read_to_string(cmd_log.path()).unwrap();
+
+    // Verify the hook actually ran and wrote output (not just that file was created)
+    assert!(
+        log_content.contains("HOOK_OUTPUT_MARKER"),
+        "Log should contain hook output, got: {log_content}"
+    );
+}
+
+#[rstest]
+fn test_concurrent_hook_multiple_failures(repo: TestRepo) {
+    // Write project config with multiple named hooks (table format).
+    // Map configs run as a concurrent group in one pipeline runner,
+    // each command producing its own log file.
+    repo.write_project_config(
+        r#"[post-start]
+first = "echo FIRST_OUTPUT"
+second = "echo SECOND_OUTPUT"
+"#,
+    );
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    // Background spawning always succeeds (spawn succeeded)
+    assert!(
+        output.status.success(),
+        "wt hook post-start should succeed (spawns in background)"
+    );
+
+    // Wait for per-command log files: runner log + first + second
+    let log_dir = resolve_git_common_dir(repo.root_path()).join("wt/logs");
+    wait_for_file_count(&log_dir, "log", 3);
+
+    // Hook logs live at `{branch}/project/post-start/{name}.log`.
+    let post_start_dir = log_dir
+        .join(worktrunk::path::sanitize_for_filename("main"))
+        .join("project")
+        .join("post-start");
+    let log_files: Vec<_> = fs::read_dir(&post_start_dir)
+        .unwrap_or_else(|e| panic!("reading {post_start_dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // Verify each command's output is in its own log file
+    for (task, expected) in [("first", "FIRST_OUTPUT"), ("second", "SECOND_OUTPUT")] {
+        let log_file = log_files
+            .iter()
+            .find(|e| e.file_name().to_string_lossy().starts_with(task))
+            .unwrap_or_else(|| panic!("should have log file for {task}"));
+
+        wait_for_file_content(&log_file.path());
+        let content = fs::read_to_string(log_file.path()).unwrap();
+        assert!(
+            content.contains(expected),
+            "Log for {task} should contain {expected}, got: {content}"
+        );
+    }
+}
+
+#[rstest]
+fn test_concurrent_hook_user_and_project(repo: TestRepo) {
+    // Write user config with post-start hook (using table format for named hook)
+    repo.write_test_config(
+        r#"[post-start]
+user = "echo 'USER_HOOK' > user_hook_ran.txt"
+"#,
+    );
+
+    // Write project config with post-start hook
+    repo.write_project_config(r#"post-start = "echo 'PROJECT_HOOK' > project_hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-start should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Both hooks spawn in background - wait for marker files
+    let user_marker = repo.root_path().join("user_hook_ran.txt");
+    let project_marker = repo.root_path().join("project_hook_ran.txt");
+
+    wait_for_file_content(&user_marker);
+    wait_for_file_content(&project_marker);
+
+    let user_content = fs::read_to_string(&user_marker).unwrap();
+    let project_content = fs::read_to_string(&project_marker).unwrap();
+    assert!(user_content.contains("USER_HOOK"));
+    assert!(project_content.contains("PROJECT_HOOK"));
+}
+
+#[rstest]
+fn test_concurrent_hook_post_switch(repo: TestRepo) {
+    // Write project config with post-switch hook
+    repo.write_project_config(r#"post-switch = "echo 'POST_SWITCH' > hook_ran.txt""#);
+
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-switch", "--yes"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-switch should succeed"
+    );
+
+    // Hook spawns in background - wait for marker file
+    let marker = repo.root_path().join("hook_ran.txt");
+    wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(content.contains("POST_SWITCH"));
+}
+
+#[rstest]
+fn test_concurrent_hook_with_name_filter(repo: TestRepo) {
+    // Write project config with multiple named hooks
+    repo.write_project_config(
+        r#"[post-start]
+first = "echo 'FIRST' > first.txt"
+second = "echo 'SECOND' > second.txt"
+"#,
+    );
+
+    // Run only the "first" hook by name
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "first"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt hook post-start --name first should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // First hook spawns in background - wait for marker file
+    let first_marker = repo.root_path().join("first.txt");
+    let second_marker = repo.root_path().join("second.txt");
+
+    wait_for_file_content(&first_marker);
+
+    // Fixed sleep for absence check - second hook should NOT have run
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+    assert!(!second_marker.exists(), "second hook should NOT have run");
+}
+
+#[rstest]
+fn test_concurrent_hook_invalid_name_filter(repo: TestRepo) {
+    // Write project config with named hooks
+    repo.write_project_config(
+        r#"[post-start]
+first = "echo 'FIRST'"
+"#,
+    );
+
+    // Try to run a non-existent hook by name
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "nonexistent"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "wt hook post-start --name nonexistent should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nonexistent") && stderr.contains("No command named"),
+        "Error should mention command not found, got: {stderr}"
+    );
+    // Should list available commands
+    assert!(
+        stderr.contains("project:first"),
+        "Error should list available commands, got: {stderr}"
+    );
+}
+
+#[rstest]
+fn test_hook_multiple_name_filters(repo: TestRepo) {
+    // Write project config with three named hooks
+    repo.write_project_config(
+        r#"pre-merge = [
+    {first = "echo FIRST"},
+    {second = "echo SECOND"},
+    {third = "echo THIRD"},
+]
+"#,
+    );
+
+    // Run only "first" and "second" by passing multiple names — "third" should not run
+    assert_cmd_snapshot!(
+        "hook_multiple_name_filters",
+        make_snapshot_cmd(
+            &repo,
+            "hook",
+            &["pre-merge", "first", "second", "--yes"],
+            None
+        )
+    );
+}
+
+/// A source-scoped filter must not bleed its name into another source.
+/// `wt hook pre-merge user:foo bar`, with user `foo`, project `foo`, and
+/// project `bar` defined, runs user `foo` and project `bar` — but not project
+/// `foo`, which the `user:foo` scope excludes even though the unscoped `bar`
+/// admits the project source.
+///
+/// Each command writes a marker file rather than echoing. The announcement
+/// prints a command's body before running it, so asserting on stdout would
+/// pin which commands were selected rather than which ones ran.
+#[rstest]
+fn test_hook_source_scoped_filter_does_not_bleed_into_other_source(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-merge]
+foo = "echo ran > user_foo.txt"
+"#,
+    );
+    repo.write_project_config(
+        r#"[pre-merge]
+foo = "echo ran > project_foo.txt"
+bar = "echo ran > project_bar.txt"
+"#,
+    );
+    repo.commit("Add pre-merge hooks");
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", "user:foo", "bar", "--yes"])
+        .output()
+        .expect("Failed to run wt hook pre-merge");
+
+    assert!(
+        output.status.success(),
+        "wt hook pre-merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        repo.root_path().join("user_foo.txt").exists(),
+        "user:foo should run the user's foo"
+    );
+    assert!(
+        repo.root_path().join("project_bar.txt").exists(),
+        "unscoped bar should run the project's bar"
+    );
+    assert!(
+        !repo.root_path().join("project_foo.txt").exists(),
+        "project foo must not run — user:foo is scoped to the user source"
+    );
+}
+
+/// Source selection excludes malformed templates in the other configuration.
+#[rstest]
+#[case::user(HookSource::User)]
+#[case::project(HookSource::Project)]
+fn test_hook_bare_source_filter_runs_that_source(repo: TestRepo, #[case] source: HookSource) {
+    let selected = r#"[pre-merge]
+fmt = "echo ran > selected_fmt.txt"
+lint = "echo ran > selected_lint.txt"
+"#;
+    let excluded = r#"pre-merge = "echo {{ unclosed""#;
+    match source {
+        HookSource::User => {
+            repo.write_test_config(selected);
+            repo.write_project_config(excluded);
+        }
+        HookSource::Project => {
+            repo.write_test_config(excluded);
+            repo.write_project_config(selected);
+        }
+    }
+    repo.commit("Add pre-merge hooks");
+    let filter = format!("{source}:");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", &filter, "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.root_path().join("selected_fmt.txt").exists()
+            && repo.root_path().join("selected_lint.txt").exists()
+    );
+}
+
+/// Only selected commands participate in syntax validation and shorthand binding.
+#[rstest]
+#[case::syntax("echo {{ unclosed")]
+#[case::routing("echo {{ key }}")]
+fn test_hook_named_filter_selects_before_template_parsing(
+    repo: TestRepo,
+    #[case] excluded_template: &str,
+    #[values(HookSource::User, HookSource::Project)] source: HookSource,
+) {
+    let config = format!(
+        r#"[pre-merge]
+valid = "printf '%s' {{{{ args }}}} > selected.txt"
+broken = "{excluded_template}"
+"#
+    );
+    match source {
+        HookSource::User => repo.write_test_config(&config),
+        HookSource::Project => repo.write_project_config(&config),
+    }
+    let filter = format!("{source}:valid");
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", &filter, "--yes", "--key=value"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("selected.txt")).unwrap(),
+        "--key=value"
+    );
+}
+
+/// A bare source filter that matches nothing means the source configures no
+/// hooks of this type — there is no name to have misspelled, so the error says
+/// so and points at the invocation that works.
+#[rstest]
+fn test_hook_bare_source_filter_reports_unconfigured_source(repo: TestRepo) {
+    repo.write_project_config(
+        r#"[pre-merge]
+test = "echo TEST"
+lint = "echo LINT"
+"#,
+    );
+    repo.commit("Add pre-merge hooks");
+
+    assert_cmd_snapshot!(
+        "hook_bare_user_filter_without_user_hooks",
+        make_snapshot_cmd(&repo, "hook", &["pre-merge", "user:", "--yes"], None)
+    );
+}
+
+/// A filter list that also names a command is answered about that name, not
+/// about a source. `user:` alone would report the unconfigured source, but
+/// alongside `project:nope` that answer would leave `nope` unmentioned and
+/// offer an invocation the user didn't ask for — so the mixed list falls
+/// through to `HookCommandNotFound`, which lists what the named scopes hold.
+#[rstest]
+fn test_hook_mixed_source_and_name_filter_reports_the_name(repo: TestRepo) {
+    repo.write_project_config(
+        r#"[pre-merge]
+test = "echo TEST"
+"#,
+    );
+    repo.commit("Add pre-merge hooks");
+
+    assert_cmd_snapshot!(
+        "hook_mixed_filter_falls_through_to_name_error",
+        make_snapshot_cmd(
+            &repo,
+            "hook",
+            &["pre-merge", "user:", "project:nope", "--yes"],
+            None
+        )
+    );
+}
+
+/// The mirror of the above: `project:` against a repo whose hooks are all in
+/// user config.
+#[rstest]
+fn test_hook_bare_project_filter_reports_unconfigured_source(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-merge]
+fmt = "echo FMT"
+"#,
+    );
+
+    assert_cmd_snapshot!(
+        "hook_bare_project_filter_without_project_hooks",
+        make_snapshot_cmd(&repo, "hook", &["pre-merge", "project:", "--yes"], None)
+    );
+}
+
+/// With neither source configuring the hook type, there is no working
+/// invocation to suggest — an empty `[pre-merge]` table is a project config
+/// that exists but contributes no commands, so this misses without the
+/// "no hooks configured at all" early exit taking over.
+#[rstest]
+fn test_hook_bare_source_filter_omits_hint_when_neither_source_configured(repo: TestRepo) {
+    repo.write_project_config("[pre-merge]\n");
+    repo.commit("Add empty pre-merge table");
+
+    assert_cmd_snapshot!(
+        "hook_bare_project_filter_no_hooks_anywhere",
+        make_snapshot_cmd(&repo, "hook", &["pre-merge", "project:", "--yes"], None)
+    );
+}
+
+#[rstest]
+fn test_hook_multiple_name_filters_none_match(repo: TestRepo) {
+    // Write project config with named hooks
+    repo.write_project_config(
+        r#"[pre-merge]
+first = "echo FIRST"
+"#,
+    );
+
+    // Run with multiple names that don't match any configured hook
+    assert_cmd_snapshot!(
+        "hook_multiple_name_filters_none_match",
+        make_snapshot_cmd(&repo, "hook", &["pre-merge", "foo", "bar", "--yes"], None)
+    );
+}
+
+// ============================================================================
+// Custom Variable (--var) Tests
+// ============================================================================
+
+#[rstest]
+fn test_var_flag_overrides_template_variable(repo: TestRepo) {
+    // Write user config with a hook that uses a template variable
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ target }}' > target_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--var",
+            "target=CUSTOM_TARGET",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success(), "Hook should succeed");
+
+    let output_file = repo.root_path().join("target_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("CUSTOM_TARGET"),
+        "Variable should be overridden in hook, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_flag_multiple_variables(repo: TestRepo) {
+    // Write user config with a hook that uses multiple template variables
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ target }} {{ remote }}' > multi_var_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--var",
+            "target=FIRST",
+            "--var",
+            "remote=SECOND",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success(), "Hook should succeed");
+
+    let output_file = repo.root_path().join("multi_var_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("FIRST") && contents.contains("SECOND"),
+        "Both variables should be overridden, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_flag_overrides_builtin_variable(repo: TestRepo) {
+    // Write user config with a hook that uses the builtin branch variable
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ branch }}' > branch_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--var",
+            "branch=CUSTOM_BRANCH_NAME",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success(), "Hook should succeed");
+
+    let output_file = repo.root_path().join("branch_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("CUSTOM_BRANCH_NAME"),
+        "Custom variable should override builtin, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_flag_invalid_format_fails() {
+    // Test that invalid KEY=VALUE format is rejected
+    let output = crate::common::wt_command()
+        .args(["hook", "pre-start", "--var", "no_equals_sign"])
+        .output()
+        .expect("Failed to run wt");
+
+    assert!(!output.status.success(), "Invalid --var format should fail");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expected KEY=VALUE"),
+        "Error should mention invalid format, got: {stderr}"
+    );
+}
+
+#[rstest]
+fn test_var_flag_custom_variable(repo: TestRepo) {
+    // Custom variable names (not built-in template vars) are accepted and
+    // injected into the template context, matching alias behavior.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ custom_var }}' > custom_var_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--var", "custom_var=hello"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Custom variable should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_file = repo.root_path().join("custom_var_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("hello"),
+        "Custom variable should be expanded, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_flag_last_value_wins(repo: TestRepo) {
+    // Test that when the same variable is specified multiple times, the last value wins
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ target }}' > target_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--var",
+            "target=FIRST",
+            "--var",
+            "target=SECOND",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success());
+
+    let output_file = repo.root_path().join("target_output.txt");
+    let contents = std::fs::read_to_string(&output_file).expect("Should have created output file");
+    assert!(
+        contents.contains("SECOND"),
+        "Last --var value should win, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_shorthand_overrides_template_variable(repo: TestRepo) {
+    // `--KEY=VALUE` is equivalent to `--var KEY=VALUE` for template variables.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ branch }}' > shorthand_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--branch=SHORTHAND_BRANCH"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_file = repo.root_path().join("shorthand_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("SHORTHAND_BRANCH"),
+        "Shorthand should override template variable, got: {contents}"
+    );
+}
+
+/// `--args=VALUE` forwards into `{{ args }}` rather than binding it, since the
+/// forwarded positional list would overwrite the binding and drop the token.
+#[rstest]
+fn test_var_shorthand_args_key_forwards(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ args }}' > args_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--args=KEPT"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("args_output.txt")).unwrap();
+    assert!(
+        contents.contains("--args=KEPT"),
+        "--args=KEPT should forward into args, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_shorthand_mixed_with_long_form(repo: TestRepo) {
+    // Shorthand and `--var` forms coexist in the same invocation.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ branch }} {{ target }}' > mixed_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--branch=SHORT",
+            "--var",
+            "target=LONG",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success());
+
+    let output_file = repo.root_path().join("mixed_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("SHORT") && contents.contains("LONG"),
+        "Both forms should coexist, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_shorthand_custom_variable(repo: TestRepo) {
+    // Custom variable names (not built-in template vars) are accepted and
+    // injected into the template context, matching alias behavior. Hyphens in
+    // variable names are canonicalized to underscores.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ my_env }}' > custom_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--my-env=staging"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Custom variable should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_file = repo.root_path().join("custom_output.txt");
+    let contents = fs::read_to_string(&output_file).unwrap();
+    assert!(
+        contents.contains("staging"),
+        "Custom variable with hyphens should be canonicalized and expanded, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_shorthand_unreferenced_forwards_to_args(repo: TestRepo) {
+    // `--KEY=VALUE` shorthand for an unreferenced KEY is smart-routed to
+    // `{{ args }}` — the hook template captures the flag verbatim.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ args }}' > args_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--unused-var=value"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("args_output.txt")).unwrap();
+    assert!(
+        contents.contains("--unused-var=value"),
+        "Unreferenced shorthand should be forwarded to {{{{ args }}}}, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_shorthand_referenced_binds_not_args(repo: TestRepo) {
+    // When KEY is referenced by any hook template, `--KEY=VALUE` binds
+    // `{{ KEY }}` and is NOT forwarded to `{{ args }}`.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ my_env }}:{{ args }}' > combined_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--my-env=staging"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success());
+
+    let contents = fs::read_to_string(repo.root_path().join("combined_output.txt")).unwrap();
+    assert_eq!(contents.trim(), "staging:");
+}
+
+#[rstest]
+fn test_post_double_dash_forwards_to_args(repo: TestRepo) {
+    // Tokens after `--` forward verbatim into `{{ args }}`.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ args }}' > dashdash_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--", "--fast", "extra"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("dashdash_output.txt")).unwrap();
+    assert!(
+        contents.contains("--fast") && contents.contains("extra"),
+        "Post-`--` tokens should forward verbatim to {{{{ args }}}}, got: {contents}"
+    );
+}
+
+#[rstest]
+fn test_var_deprecation_warning(repo: TestRepo) {
+    // Explicit `--var` still force-binds but emits a deprecation warning
+    // pointing at `--KEY=VALUE` shorthand.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ my_env }}' > deprecated_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--var", "my_env=staging"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--var is deprecated"),
+        "Expected --var deprecation warning, got: {stderr}"
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("deprecated_output.txt")).unwrap();
+    assert_eq!(contents.trim(), "staging");
+}
+
+#[rstest]
+fn test_args_indexing_and_length_in_hook_template(repo: TestRepo) {
+    // `{{ args }}` is a ShellArgs sequence — indexing, length, and iteration
+    // all work the same as in alias templates.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ args[0] | default('none') }}:{{ args | length }}' > args_seq.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-start", "--yes", "--", "first", "second"])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(output.status.success());
+
+    let contents = fs::read_to_string(repo.root_path().join("args_seq.txt")).unwrap();
+    assert_eq!(contents.trim(), "first:2");
+}
+
+#[rstest]
+fn test_mixed_var_shorthand_and_forwarded_args(repo: TestRepo) {
+    // Explicit `--var` binds, referenced shorthand binds, unreferenced shorthand
+    // + post-`--` tokens forward — all coexist in one invocation without
+    // cross-contamination.
+    repo.write_test_config(
+        r#"[pre-start]
+test = "echo '{{ my_env }}|{{ override }}|{{ args }}' > mixed_output.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args([
+            "hook",
+            "pre-start",
+            "--yes",
+            "--my-env=prod",
+            "--var",
+            "override=forced",
+            "--unused=x",
+            "--",
+            "extra",
+        ])
+        .output()
+        .expect("Failed to run wt hook");
+
+    assert!(
+        output.status.success(),
+        "Hook should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = fs::read_to_string(repo.root_path().join("mixed_output.txt")).unwrap();
+    let trimmed = contents.trim();
+    assert!(
+        trimmed.starts_with("prod|forced|"),
+        "Expected my_env + override bound, got: {trimmed}"
+    );
+    assert!(
+        trimmed.contains("--unused=x") && trimmed.contains("extra"),
+        "Unreferenced + post-`--` tokens should forward to {{{{ args }}}}, got: {trimmed}"
+    );
+}
+
+#[test]
+fn test_var_shorthand_does_not_leak_into_hook_show() {
+    // `wt hook show` doesn't accept `--var`, so shorthand preprocessing must
+    // leave its argv alone — an unknown flag should still produce clap's
+    // "unexpected argument" error, not a template-variable error.
+    let output = crate::common::wt_command()
+        .args(["hook", "show", "--branch=feature"])
+        .output()
+        .expect("Failed to run wt");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") || stderr.contains("--branch"),
+        "Expected clap to reject --branch on `hook show`, got: {stderr}"
+    );
+}
+
+// ============================================================================
+// Hook Order Preservation Tests (Issue #737)
+// ============================================================================
+
+/// Test that user hooks execute in TOML insertion order, not alphabetical
+/// See: https://github.com/max-sixty/worktrunk/issues/737
+#[rstest]
+fn test_user_hooks_preserve_toml_order(repo: TestRepo) {
+    // Write user config with hooks in specific order (NOT alphabetical: vscode, claude, copy, submodule)
+    // If order were alphabetical, it would be: claude, copy, submodule, vscode
+    // Table-form commands run concurrently; WORKTRUNK_TEST_SERIAL_CONCURRENT
+    // runs the group one command at a time in declaration order, so the file
+    // appends (and the snapshot) expose the parsed TOML order.
+    repo.write_test_config(
+        r#"[pre-start]
+vscode = "echo '1' >> hook_order.txt"
+claude = "echo '2' >> hook_order.txt"
+copy = "echo '3' >> hook_order.txt"
+submodule = "echo '4' >> hook_order.txt"
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(&repo, "switch", &["--create", "feature"], None);
+        cmd.env("WORKTRUNK_TEST_SERIAL_CONCURRENT", "1");
+        assert_cmd_snapshot!("user_hooks_preserve_order", cmd);
+    });
+
+    // Verify execution order by reading the output file
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let order_file = worktree_path.join("hook_order.txt");
+    assert!(order_file.exists(), "hook_order.txt should be created");
+
+    let contents = fs::read_to_string(&order_file).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+
+    // Hooks should execute in TOML order: 1, 2, 3, 4
+    assert_eq!(
+        lines,
+        vec!["1", "2", "3", "4"],
+        "Hooks should execute in TOML insertion order (vscode, claude, copy, submodule)"
+    );
+}
+
+// ============================================================================
+// User Pre-Switch Hook Tests
+// ============================================================================
+
+/// Test that a pre-switch hook executes before switching to an existing worktree
+#[rstest]
+fn test_user_pre_switch_hook_executes(mut repo: TestRepo) {
+    // Create a worktree to switch to
+    let _feature_wt = repo.add_worktree("feature");
+
+    // Write user config with pre-switch hook that creates a marker in the current worktree
+    repo.write_test_config(
+        r#"[pre-switch]
+check = "echo 'USER_PRE_SWITCH_RAN' > pre_switch_marker.txt"
+"#,
+    );
+
+    snapshot_switch("user_pre_switch_executes", &repo, &["feature"]);
+
+    // Verify user hook ran in the source worktree (main), not the destination
+    let marker_file = repo.root_path().join("pre_switch_marker.txt");
+    assert!(
+        marker_file.exists(),
+        "User pre-switch hook should have created marker in source worktree"
+    );
+
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert!(
+        contents.contains("USER_PRE_SWITCH_RAN"),
+        "Marker file should contain expected content"
+    );
+}
+
+/// Switching out of a detached worktree leaves `base` unset rather than empty:
+/// `base` is the source branch, and there isn't one. Only `is defined`
+/// separates that from the `unwrap_or_default()` this replaced — both render
+/// as nothing under `{% if base %}` — so this pins the distinction the
+/// `(unset)` label in `wt -v` depends on (issue #4009).
+#[rstest]
+fn test_user_pre_switch_base_unset_in_detached_worktree(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+    repo.add_worktree("detached-src");
+    repo.detach_head_in_worktree("detached-src");
+    let src_path = repo.worktree_path("detached-src");
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'base=[{% if base is defined %}defined:{{ base }}{% else %}unset{% endif %}]' > ../preswitch_detached.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["switch", "feature"])
+        .current_dir(src_path)
+        .output()
+        .unwrap();
+
+    let vars_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("preswitch_detached.txt");
+    crate::common::wait_for_file_content(&vars_file);
+
+    let content = std::fs::read_to_string(&vars_file).unwrap();
+    assert_eq!(
+        content.trim(),
+        "base=[unset]",
+        "pre-switch `base` should be unset when switching out of a detached worktree, got: {content}"
+    );
+}
+
+/// Test that a failing pre-switch hook blocks the switch (including --create)
+#[rstest]
+fn test_user_pre_switch_failure_blocks_switch(repo: TestRepo) {
+    // Write user config with failing pre-switch hook
+    repo.write_test_config(
+        r#"[pre-switch]
+block = "exit 1"
+"#,
+    );
+
+    // Failing pre-switch should prevent worktree creation
+    snapshot_switch("user_pre_switch_failure", &repo, &["--create", "feature"]);
+
+    // Worktree should NOT have been created
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    assert!(
+        !worktree_path.exists(),
+        "Worktree should not be created when pre-switch hook fails"
+    );
+}
+
+/// Test that --no-hooks skips the pre-switch hook
+#[rstest]
+fn test_user_pre_switch_skipped_with_no_hooks(repo: TestRepo) {
+    // Write user config with pre-switch hook that creates a marker
+    repo.write_test_config(
+        r#"[pre-switch]
+check = "echo 'SHOULD_NOT_RUN' > pre_switch_marker.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "user_pre_switch_no_hooks",
+        &repo,
+        &["--create", "feature", "--no-hooks"],
+    );
+
+    // Pre-switch hook should NOT have run (--no-hooks skips all hooks)
+    let marker_file = repo.root_path().join("pre_switch_marker.txt");
+    assert!(
+        !marker_file.exists(),
+        "Pre-switch hook should be skipped with --no-hooks"
+    );
+}
+
+/// Test that `wt hook pre-switch` runs pre-switch hooks manually
+#[rstest]
+fn test_user_pre_switch_manual_hook(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-switch]
+check = "echo 'MANUAL_PRE_SWITCH' > pre_switch_marker.txt"
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(&repo, "hook", &["pre-switch"], None);
+        assert_cmd_snapshot!("user_pre_switch_manual", cmd);
+    });
+
+    let marker_file = repo.root_path().join("pre_switch_marker.txt");
+    assert!(
+        marker_file.exists(),
+        "Manual pre-switch hook should have created marker"
+    );
+}
+
+/// A manual `wt hook <type>` in a detached worktree leaves `branch` unset, and
+/// the `base` / `target` names it derives from the current branch follow —
+/// rather than naming the literal `HEAD`, which git resolves as a ref (issue
+/// #4009). The directional *path* vars still apply: the worktree exists
+/// whether or not it is on a branch, so `{{ base_worktree_path }}` renders
+/// unguarded here.
+#[rstest]
+fn test_manual_hook_branch_vars_unset_in_detached_worktree(mut repo: TestRepo) {
+    repo.add_worktree("detached-test");
+    repo.detach_head_in_worktree("detached-test");
+    let detached = repo.worktree_path("detached-test").to_path_buf();
+
+    repo.write_test_config(
+        r#"[pre-switch]
+record = "echo 'branch=[{% if branch %}{{ branch }}{% endif %}] base=[{% if base %}{{ base }}{% endif %}] target=[{% if target %}{{ target }}{% endif %}] base_worktree_path=[{{ base_worktree_path }}]' > vars.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-switch"])
+        .current_dir(&detached)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "manual hook failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let recorded = std::fs::read_to_string(detached.join("vars.txt"))
+        .expect("hook should have recorded its variables");
+    assert!(
+        recorded.starts_with("branch=[] base=[] target=[] base_worktree_path=["),
+        "branch, base and target must be unset in a detached worktree, got: {recorded}"
+    );
+    assert!(
+        !recorded.contains("base_worktree_path=[]"),
+        "base_worktree_path should still name the detached worktree, got: {recorded}"
+    );
+}
+
+/// Test that `{{ branch }}` in pre-switch hooks is the destination branch argument, not the source.
+#[rstest]
+fn test_user_pre_switch_branch_var_is_destination(mut repo: TestRepo) {
+    let _feature_wt = repo.add_worktree("feature-dest");
+
+    // Write pre-switch hook that records {{ branch }} into a marker file
+    repo.write_test_config(
+        r#"[pre-switch]
+check = "echo '{{ branch }}' > pre_switch_branch.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "user_pre_switch_branch_destination",
+        &repo,
+        &["feature-dest"],
+    );
+
+    // {{ branch }} should be the destination branch, not the source (main)
+    let marker_file = repo.root_path().join("pre_switch_branch.txt");
+    assert!(
+        marker_file.exists(),
+        "Pre-switch hook should have created marker"
+    );
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(
+        contents.trim(),
+        "feature-dest",
+        "{{{{ branch }}}} should be the destination branch 'feature-dest', got: '{}'",
+        contents.trim(),
+    );
+}
+
+/// A symbolic switch argument (`@`, `-`, `^`) is resolved to its concrete branch
+/// name before the pre-switch hook runs, so `{{ branch }}` carries the resolved
+/// destination — not the literal token. Here `@` resolves to the current branch.
+#[rstest]
+fn test_user_pre_switch_branch_var_resolves_symbolic(repo: TestRepo) {
+    repo.write_test_config(
+        r#"[pre-switch]
+check = "echo '{{ branch }}' > pre_switch_symbolic.txt"
+"#,
+    );
+
+    // `@` resolves to the current branch (main), not the literal "@".
+    snapshot_switch("user_pre_switch_branch_symbolic", &repo, &["@"]);
+
+    let marker_file = repo.root_path().join("pre_switch_symbolic.txt");
+    assert!(
+        marker_file.exists(),
+        "Pre-switch hook should have created marker"
+    );
+    let contents = fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(
+        contents.trim(),
+        "main",
+        "symbolic '@' should resolve to the concrete branch 'main', got: '{}'",
+        contents.trim(),
+    );
+}
+
+/// When removing the current worktree, post-switch hooks should fire
+/// because the user is implicitly switched back to the primary worktree.
+/// Regression test for https://github.com/max-sixty/worktrunk/issues/1450
+///
+/// Config is committed before creating the worktree, so both worktrees
+/// have .config/wt.toml — isolating the bug to the deleted-cwd problem.
+#[rstest]
+fn test_remove_current_worktree_fires_post_switch_hook(mut repo: TestRepo) {
+    // Write and commit project config BEFORE creating the worktree,
+    // so the feature worktree also has .config/wt.toml
+    repo.write_project_config(
+        r#"post-switch = "echo 'POST_SWITCH_AFTER_REMOVE' > post_switch_marker.txt""#,
+    );
+    repo.commit("Add project config with post-switch hook");
+
+    let feature_path = repo.add_worktree("feature");
+
+    // Remove from WITHIN the feature worktree (current worktree removal)
+    repo.wt_command()
+        .args(["remove", "feature", "--force-delete", "--yes"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+
+    // Post-switch hook should fire in the primary worktree
+    let marker = repo.root_path().join("post_switch_marker.txt");
+    wait_for_file_content(&marker);
+    let content = fs::read_to_string(&marker).unwrap();
+    assert!(
+        content.contains("POST_SWITCH_AFTER_REMOVE"),
+        "Post-switch hook should run when removing current worktree, got: {content}"
+    );
+}
+
+// ==========================================================================
+// Active model: directional template variables
+// ==========================================================================
+
+/// Pre-switch to existing worktree: worktree_path = destination (Active),
+/// base_worktree_path = source, cwd = source.
+#[rstest]
+fn test_pre_switch_vars_point_to_destination(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    // Hook captures worktree_path, base_worktree_path, and cwd
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'wt_path={{ worktree_path }} base={{ base }} base_wt={{ base_worktree_path }} cwd={{ cwd }}' > pre_switch_vars.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["switch", "feature", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let vars_file = repo.root_path().join("pre_switch_vars.txt");
+    let content = fs::read_to_string(&vars_file).unwrap();
+
+    let feature_name = feature_path.file_name().unwrap().to_string_lossy();
+    let main_name = repo
+        .root_path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // worktree_path should be the destination (Active)
+    assert!(
+        content.contains(&format!("/{feature_name} "))
+            || content.contains(&format!(r"\{feature_name} ")),
+        "worktree_path should point to destination '{feature_name}', got: {content}"
+    );
+
+    // base should be the source branch
+    assert!(
+        content.contains("base=main"),
+        "base should be source branch 'main', got: {content}"
+    );
+
+    // cwd should be the source (where the hook actually runs)
+    assert!(
+        content.contains(&format!("/{main_name}")) || content.contains(&format!(r"\{main_name}")),
+        "cwd should point to source worktree '{main_name}', got: {content}"
+    );
+}
+
+/// Regression test for #2309: `wt switch -` should resolve the symbolic
+/// argument before setting up pre-switch hook template variables, so
+/// `{{ target }}`, `{{ target_worktree_path }}`, and the Active bare vars
+/// (`{{ worktree_path }}`, `{{ worktree_name }}`) reflect the actual destination
+/// instead of the raw `-` argument or the source worktree.
+#[rstest]
+fn test_pre_switch_vars_with_dash_shortcut(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    // Establish switch history: main -> feature. This records main as previous,
+    // so `wt switch -` from feature resolves back to main.
+    repo.wt_command()
+        .args(["switch", "feature", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    // Install the pre-switch hook after the history-building switch so the
+    // capture reflects only the `-` switch we care about.
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'target={{ target }} target_wt={{ target_worktree_path }} wt_path={{ worktree_path }} wt_name={{ worktree_name }}' > pre_switch_dash.txt"
+"#,
+    );
+
+    let switch_output = repo
+        .wt_command()
+        .args(["switch", "-", "--yes"])
+        .current_dir(&feature_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        switch_output.status.success(),
+        "`wt switch -` should succeed with a pre-switch hook referencing target_worktree_path.\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&switch_output.stdout),
+        String::from_utf8_lossy(&switch_output.stderr),
+    );
+
+    let vars_file = feature_path.join("pre_switch_dash.txt");
+    let content = fs::read_to_string(&vars_file).unwrap();
+
+    let main_name = repo
+        .root_path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    assert!(
+        content.contains("target=main"),
+        "{{{{ target }}}} should resolve to 'main' when using `-`, got: {content}"
+    );
+    // Both `target_worktree_path` and `worktree_path` should end at the main
+    // worktree directory — the layout is `... /<main_name> <next-field>=`.
+    assert!(
+        content.contains(&format!("/{main_name} wt_path="))
+            || content.contains(&format!(r"\{main_name} wt_path=")),
+        "{{{{ target_worktree_path }}}} should point to the main worktree, got: {content}"
+    );
+    assert!(
+        content.contains(&format!("/{main_name} wt_name="))
+            || content.contains(&format!(r"\{main_name} wt_name=")),
+        "{{{{ worktree_path }}}} should point to the main worktree (Active), got: {content}"
+    );
+    assert!(
+        content.contains(&format!("wt_name={main_name}")),
+        "{{{{ worktree_name }}}} should be the main worktree name, got: {content}"
+    );
+}
+
+/// Regression test for #4492: a worktree path selects the same worktree as its
+/// branch name, so the pre-switch vars must describe that destination too.
+/// The picker passes paths, so every picker switch takes this route.
+#[rstest]
+fn test_pre_switch_vars_with_path_argument(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+    let feature_name = feature_path.file_name().unwrap().to_string_lossy();
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={{ branch }} target={{ target }} wt_name={{ worktree_name }} target_wt={% if target_worktree_path %}set{% endif %} commit={% if commit %}set{% endif %}' > pre_switch_path.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", feature_path.to_str().unwrap(), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(repo.root_path().join("pre_switch_path.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch=feature target=feature wt_name={feature_name} target_wt=set commit=set"),
+    );
+}
+
+/// A detached worktree is reachable only by path. Its pre-switch vars leave
+/// `branch`/`target` unset and take `commit` from the destination's HEAD, not
+/// the source's.
+#[rstest]
+fn test_pre_switch_vars_with_detached_path_argument(mut repo: TestRepo) {
+    let detached_path = repo.add_worktree("detached");
+    repo.commit_in_worktree(&detached_path, "file.txt", "content", "detached commit");
+    repo.detach_head_in_worktree("detached");
+    let detached_sha = repo.head_sha_in(&detached_path);
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={% if branch is defined %}{{ branch }}{% else %}unset{% endif %} target={% if target is defined %}{{ target }}{% else %}unset{% endif %} commit={{ commit }}' > pre_switch_detached_path.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", detached_path.to_str().unwrap(), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content =
+        fs::read_to_string(repo.root_path().join("pre_switch_detached_path.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch=unset target=unset commit={detached_sha}"),
+    );
+}
+
+/// A remote-tracking name (`origin/feature`, which the picker passes for a
+/// remote branch) switches to the local branch, so the pre-switch vars name
+/// that branch — with its worktree when it has one, and without when the
+/// switch creates it.
+#[rstest]
+#[case::existing_worktree("feature", "set")]
+#[case::remote_only("remote-feature", "unset")]
+fn test_pre_switch_vars_with_remote_prefixed_argument(
+    #[from(repo_with_remote)] mut repo: TestRepo,
+    #[case] branch: &str,
+    #[case] target_wt: &str,
+) {
+    if branch == "feature" {
+        repo.add_worktree("feature");
+        repo.run_git(&["push", "origin", "feature"]);
+    } else {
+        repo.run_git(&["branch", branch]);
+        repo.run_git(&["push", "origin", branch]);
+        repo.run_git(&["branch", "-D", branch]);
+    }
+
+    repo.write_test_config(
+        r#"[pre-switch]
+capture = "echo 'branch={{ branch }} target={{ target }} target_wt={% if target_worktree_path %}set{% else %}unset{% endif %}' > pre_switch_remote.txt"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", &format!("origin/{branch}"), "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(repo.root_path().join("pre_switch_remote.txt")).unwrap();
+    assert_eq!(
+        content.trim(),
+        format!("branch={branch} target={branch} target_wt={target_wt}"),
+    );
+}
+
+/// A pre-switch hook that fetches makes a branch it fetched switchable in the
+/// same run — the fetch-if-stale use the hook exists for — whether the
+/// argument names the branch or its remote-tracking ref.
+#[rstest]
+#[case::branch("late")]
+#[case::remote_tracking("origin/late")]
+fn test_pre_switch_fetch_makes_branch_switchable(
+    #[from(repo_with_remote)] repo: TestRepo,
+    #[case] argument: &str,
+) {
+    // `late` exists on the remote, but nothing local knows about it yet.
+    repo.run_git(&["branch", "late"]);
+    repo.run_git(&["push", "origin", "late"]);
+    repo.run_git(&["branch", "-D", "late"]);
+    repo.run_git(&["update-ref", "-d", "refs/remotes/origin/late"]);
+
+    repo.write_test_config(
+        r#"[pre-switch]
+fetch = "git fetch -q origin"
+"#,
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["switch", argument, "--no-cd", "--yes", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["action"], "created");
+    assert_eq!(json["branch"], "late");
+}
+
+/// Post-remove: target/target_worktree_path point to where user ends up.
+#[rstest]
+fn test_post_remove_has_target_vars(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+
+    repo.write_test_config(
+        r#"[post-remove]
+capture = "echo 'branch={{ branch }} target={{ target }} target_wt={{ target_worktree_path }}' > ../postremove_target.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["remove", "feature", "--force-delete", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let vars_file = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("postremove_target.txt");
+    crate::common::wait_for_file_content(&vars_file);
+
+    let content = fs::read_to_string(&vars_file).unwrap();
+
+    // branch should be the removed branch (Active)
+    assert!(
+        content.contains("branch=feature"),
+        "branch should be removed branch 'feature', got: {content}"
+    );
+
+    // target should be the destination branch (where user ends up)
+    assert!(
+        content.contains("target=main"),
+        "target should be destination 'main', got: {content}"
+    );
+
+    // target_worktree_path should be the primary worktree
+    let main_name = repo
+        .root_path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        content.contains(&main_name),
+        "target_worktree_path should contain primary worktree name '{main_name}', got: {content}"
+    );
+}
+
+/// Post-switch for existing switches: base vars reference the source worktree.
+#[rstest]
+fn test_post_switch_has_base_vars_for_existing(mut repo: TestRepo) {
+    let feature_path = repo.add_worktree("feature");
+
+    // Post-switch hooks run in the DESTINATION worktree (feature), so write
+    // to a path relative to the worktree that will exist after switch.
+    repo.write_test_config(
+        r#"[post-switch]
+capture = "echo 'branch={{ branch }} base={{ base }}' > post_switch_base.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["switch", "feature", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    // File is written in the destination (feature) worktree
+    let vars_file = feature_path.join("post_switch_base.txt");
+    crate::common::wait_for_file_content(&vars_file);
+
+    let content = fs::read_to_string(&vars_file).unwrap();
+
+    // branch should be the destination (Active)
+    assert!(
+        content.contains("branch=feature"),
+        "branch should be destination 'feature', got: {content}"
+    );
+
+    // base should be the source branch we switched from
+    assert!(
+        content.contains("base=main"),
+        "base should be source 'main', got: {content}"
+    );
+}
+
+/// cwd always exists on disk — even when worktree_path points to a deleted directory.
+#[rstest]
+fn test_cwd_always_exists_in_post_remove(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+
+    repo.write_test_config(
+        r#"[post-remove]
+check = "test -d {{ cwd }} && echo 'cwd_exists=true' > ../cwd_check.txt || echo 'cwd_exists=false' > ../cwd_check.txt"
+"#,
+    );
+
+    repo.wt_command()
+        .args(["remove", "feature", "--force-delete", "--yes"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+
+    let check_file = repo.root_path().parent().unwrap().join("cwd_check.txt");
+    crate::common::wait_for_file_content(&check_file);
+
+    let content = fs::read_to_string(&check_file).unwrap();
+    assert!(
+        content.contains("cwd_exists=true"),
+        "cwd should point to an existing directory, got: {content}"
+    );
+}
+
+// ============================================================================
+// Pipeline Tests (list form)
+// ============================================================================
+
+#[rstest]
+fn test_user_post_start_pipeline_serial_ordering(repo: TestRepo) {
+    // Pipeline: serial step creates a marker, concurrent step reads it.
+    // Serial steps run in order, so the marker exists when the
+    // concurrent step runs.
+    repo.write_test_config(
+        r#"post-start = [
+    "echo SETUP_DONE > pipeline_marker.txt",
+    { bg = "cat pipeline_marker.txt > bg_saw_marker.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_ordering",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let bg_file = worktree_path.join("bg_saw_marker.txt");
+    wait_for_file_content(&bg_file);
+
+    let content = fs::read_to_string(&bg_file).unwrap();
+    assert!(
+        content.contains("SETUP_DONE"),
+        "Concurrent step should see serial step's output, got: {content}"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_failure_skips_later_steps(repo: TestRepo) {
+    // First step fails → second step should not run (pipeline aborts on failure).
+    repo.write_test_config(
+        r#"post-start = [
+    "exit 1",
+    { bg = "echo SHOULD_NOT_RUN > should_not_exist.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_failure",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    // Give background commands time to run (if they were going to)
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("should_not_exist.txt");
+    assert!(
+        !marker_file.exists(),
+        "Later pipeline steps should NOT run after serial step failure"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_lazy_vars_foreground(repo: TestRepo) {
+    // Pipeline step 1 sets a var, step 2 uses it via {{ vars.name }}.
+    // Foreground mode exercises the in-process execution-time render path,
+    // which reads vars fresh from git config per step.
+    repo.write_test_config(
+        r#"post-start = [
+    "git config worktrunk.state.main.vars.name '{{ branch | sanitize }}-postgres'",
+    { db = "echo {{ vars.name }} > lazy_expanded.txt" }
+]
+"#,
+    );
+
+    // Run the hook in foreground on the main worktree.
+    // Step 1 uses `git config` directly (avoids needing `wt` on PATH in CI).
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"]);
+
+    let output = cmd.output().expect("Failed to run foreground hook");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Foreground hook should succeed.\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    // With foreground, marker file should exist immediately
+    let marker_file = repo.root_path().join("lazy_expanded.txt");
+    assert!(
+        marker_file.exists(),
+        "Foreground render should create marker file"
+    );
+
+    let content = fs::read_to_string(&marker_file).unwrap().trim().to_string();
+    assert_eq!(
+        content, "main-postgres",
+        "Step 2 should see var set by prior step"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_lazy_vars_background(repo: TestRepo) {
+    // Pipeline step 1 sets a var via git config (not `wt config` — bare `wt`
+    // isn't on PATH in the detached background process). Step 2 references
+    // {{ vars.name }}, which is expanded just-in-time by the background
+    // pipeline runner reading fresh vars from git config.
+    repo.write_test_config(
+        r#"post-start = [
+    "git config worktrunk.state.{{ branch }}.vars.name '{{ branch | sanitize }}-postgres'",
+    { db = "echo {{ vars.name }} > lazy_bg_expanded.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_lazy_vars_bg",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("lazy_bg_expanded.txt");
+    wait_for_file_content(&marker_file);
+
+    let content = fs::read_to_string(&marker_file).unwrap().trim().to_string();
+    assert_eq!(
+        content, "feature-postgres",
+        "Background lazy step should see var set by prior step"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_concurrent_all_run(repo: TestRepo) {
+    // Concurrent group: both commands should run and produce output.
+    repo.write_test_config(
+        r#"post-start = [
+    { a = "echo AAA > concurrent_a.txt", b = "echo BBB > concurrent_b.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_concurrent_all",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let file_a = worktree_path.join("concurrent_a.txt");
+    let file_b = worktree_path.join("concurrent_b.txt");
+    wait_for_file_content(&file_a);
+    wait_for_file_content(&file_b);
+
+    let a = fs::read_to_string(&file_a).unwrap();
+    let b = fs::read_to_string(&file_b).unwrap();
+    assert!(
+        a.contains("AAA"),
+        "concurrent command 'a' should run, got: {a}"
+    );
+    assert!(
+        b.contains("BBB"),
+        "concurrent command 'b' should run, got: {b}"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_concurrent_partial_failure(repo: TestRepo) {
+    // One command in a concurrent group fails. The other should still
+    // complete (pipeline waits for all children), and later steps should
+    // not run (group reported as failed).
+    repo.write_test_config(
+        r#"post-start = [
+    { fail = "exit 1", ok = "echo SURVIVED > concurrent_survivor.txt" },
+    "echo SHOULD_NOT_RUN > after_concurrent.txt"
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_concurrent_failure",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    // The surviving command should complete despite the sibling failing.
+    let survivor = worktree_path.join("concurrent_survivor.txt");
+    wait_for_file_content(&survivor);
+    let content = fs::read_to_string(&survivor).unwrap();
+    assert!(
+        content.contains("SURVIVED"),
+        "Non-failing concurrent command should still complete, got: {content}"
+    );
+
+    // The step after the failed group should NOT run.
+    thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+    let after = worktree_path.join("after_concurrent.txt");
+    assert!(
+        !after.exists(),
+        "Steps after a failed concurrent group should not run"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_pipeline_shell_escaping(repo: TestRepo) {
+    // Template values containing shell metacharacters must be safely
+    // escaped. Step 1 sets a var with spaces, quotes, and a dollar sign.
+    // Step 2 expands it into a shell command — without shell_escape=true,
+    // the value would be word-split or trigger expansion.
+    repo.write_test_config(
+        r#"post-start = [
+    "git config worktrunk.state.{{ branch }}.vars.tricky 'hello world $HOME \"quotes\"'",
+    { check = "echo {{ vars.tricky }} > escaped_output.txt" }
+]
+"#,
+    );
+
+    // Use foreground so we can check the result immediately.
+    let mut cmd = crate::common::wt_command();
+    cmd.current_dir(repo.root_path());
+    cmd.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    cmd.args(["hook", "post-start", "--yes", "--foreground"]);
+
+    let output = cmd.output().expect("Failed to run foreground hook");
+    assert!(
+        output.status.success(),
+        "Hook should succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let marker_file = repo.root_path().join("escaped_output.txt");
+    assert!(marker_file.exists(), "Escaped output file should exist");
+
+    let content = fs::read_to_string(&marker_file).unwrap().trim().to_string();
+    // The value should arrive intact — not word-split, not $HOME-expanded.
+    assert!(
+        content.contains("hello world"),
+        "Spaces should not cause word splitting, got: {content}"
+    );
+    assert!(
+        content.contains("$HOME"),
+        "$HOME should be literal, not expanded, got: {content}"
+    );
+    assert!(
+        content.contains("\"quotes\""),
+        "Quotes should survive escaping, got: {content}"
+    );
+}
+
+// ============================================================================
+// Pipeline hook_name isolation (Bug 2 regression test)
+// ============================================================================
+
+#[rstest]
+fn test_user_post_start_pipeline_hook_name_per_step(repo: TestRepo) {
+    // Each step in a pipeline should see its own hook_name, not the first step's name.
+    // Before the fix, step 2 would see step 1's hook_name because a single shared
+    // pipeline context carried the first command's hook_name to every step.
+    repo.write_test_config(
+        r#"post-start = [
+    { step_one = "echo {{ hook_name }} > step_one_name.txt" },
+    { step_two = "echo {{ hook_name }} > step_two_name.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_pipeline_hook_name_per_step",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+
+    let step_one_file = worktree_path.join("step_one_name.txt");
+    let step_two_file = worktree_path.join("step_two_name.txt");
+    wait_for_file_content(&step_one_file);
+    wait_for_file_content(&step_two_file);
+
+    let step_one_name = fs::read_to_string(&step_one_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    let step_two_name = fs::read_to_string(&step_two_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        step_one_name, "step_one",
+        "Step 1 should see its own hook_name"
+    );
+    assert_eq!(
+        step_two_name, "step_two",
+        "Step 2 should see its own hook_name, not step 1's"
+    );
+}
+
+#[rstest]
+fn test_user_post_switch_pipeline_via_switch_create(repo: TestRepo) {
+    // Post-switch with pipeline config, triggered by `wt switch --create`.
+    // This exercises the pipeline branch in `spawn_switch_background_hooks`,
+    // which spawns each hook type's pipeline independently.
+    repo.write_test_config(
+        r#"post-switch = [
+    "echo SWITCH_STEP_1 > switch_step1.txt",
+    { check = "cat switch_step1.txt > switch_step2.txt" }
+]
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_switch_pipeline_via_create",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let step2_file = worktree_path.join("switch_step2.txt");
+    wait_for_file_content(&step2_file);
+
+    let content = fs::read_to_string(&step2_file).unwrap();
+    assert!(
+        content.contains("SWITCH_STEP_1"),
+        "Pipeline serial ordering should be preserved for post-switch, got: {content}"
+    );
+}
+
+// ============================================================================
+// Post-remove pipeline (Bug 1 regression test)
+// ============================================================================
+
+#[rstest]
+fn test_user_post_remove_pipeline_serial_ordering(mut repo: TestRepo) {
+    // Post-remove with a pipeline config should preserve serial ordering.
+    // Before the fix, prepare_post_remove_commands returned flat commands,
+    // so pipeline configs lost serial/concurrent semantics.
+    let _feature_wt = repo.add_worktree("feature");
+
+    repo.write_test_config(
+        r#"post-remove = [
+    "echo REMOVE_STEP_1 > ../remove_step1.txt",
+    "cat ../remove_step1.txt > ../remove_step2.txt"
+]
+"#,
+    );
+
+    snapshot_remove(
+        "user_post_remove_pipeline_ordering",
+        &repo,
+        &["feature", "--force-delete"],
+        Some(repo.root_path()),
+    );
+
+    // Step 2 reads step 1's output. With pipeline semantics, step 2 runs after step 1.
+    let parent = repo.root_path().parent().unwrap();
+    let step2_file = parent.join("remove_step2.txt");
+    wait_for_file_content(&step2_file);
+
+    let content = fs::read_to_string(&step2_file).unwrap();
+    assert!(
+        content.contains("REMOVE_STEP_1"),
+        "Step 2 should see step 1's output (serial pipeline), got: {content}"
+    );
+}
+
+// ============================================================================
+// Name-filtered vars template (Bug 3 regression test)
+// ============================================================================
+
+#[rstest]
+fn test_standalone_hook_name_filtered_vars_template(repo: TestRepo) {
+    // A pipeline step that uses {{ vars.X }} should expand correctly when
+    // name-filtered via `wt hook post-start db`. Before the fix, the flat
+    // spawn path passed the raw unexpanded template to the shell.
+    //
+    // vars.* are read from git config, so we pre-set the value.
+    repo.write_test_config(
+        r#"post-start = [
+    { setup = "echo setup" },
+    { db = "echo {{ vars.name }} > vars_filtered.txt" }
+]
+"#,
+    );
+
+    // Pre-set vars.name via git config (same mechanism as pipeline step 1 would use).
+    // Test repo starts on main branch.
+    repo.run_git(&["config", "worktrunk.state.main.vars.name", "test-db"]);
+
+    // Run just the 'db' step by name. This goes through the flat background path
+    // since name filtering bypasses the pipeline runner.
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd(&repo, "hook", &["post-start", "db"], None);
+        assert_cmd_snapshot!("standalone_hook_name_filtered_vars_template", cmd);
+    });
+
+    let marker_file = repo.root_path().join("vars_filtered.txt");
+    wait_for_file_content(&marker_file);
+
+    let content = fs::read_to_string(&marker_file).unwrap().trim().to_string();
+    assert_eq!(
+        content, "test-db",
+        "Template should expand {{ vars.name }} from git config"
+    );
+}
+
+/// Multi-remove hook announcements include the branch name for disambiguation
+#[rstest]
+fn test_multi_remove_hook_announcements_include_branch(repo: TestRepo) {
+    // fixture already has feature-a, feature-b, feature-c worktrees
+    repo.write_test_config(
+        r#"[post-remove]
+cleanup = "echo done"
+"#,
+    );
+
+    snapshot_remove(
+        "multi_remove_hook_branch_context",
+        &repo,
+        &["feature-a", "feature-b", "--force-delete"],
+        Some(repo.root_path()),
+    );
+}
+
+/// Foreground hooks pass the directive file through to child processes,
+/// so inner `wt switch --create` can write cd directives back to the
+/// parent shell via the CD directive file.
+#[rstest]
+fn test_foreground_hook_passes_directive_file(repo: TestRepo) {
+    use crate::common::{configure_directive_file, directive_file, wt_bin};
+
+    repo.commit("initial");
+
+    let wt = wt_bin();
+    let wt_str = wt.to_string_lossy();
+    assert!(
+        !wt_str.contains('\''),
+        "wt binary path should not contain single quotes: {wt_str}"
+    );
+    let wt_toml = wt_str.replace('\\', r"\\");
+
+    // Pre-start hook that creates a new worktree via `wt switch --create`.
+    // If the CD directive file is passed through, the inner wt will write a
+    // path to it. If scrubbed, it prints the "shell integration not
+    // installed" hint instead.
+    repo.write_test_config(&format!(
+        r#"
+[pre-start]
+setup = "'{wt_toml}' switch --create hook-created --no-hooks"
+"#,
+    ));
+
+    let (cd_path, _guard) = directive_file();
+
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    // Run the pre-start hook manually in foreground
+    cmd.args(["hook", "pre-start", "setup"]);
+    let output = cmd.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "hook failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let cd_content = std::fs::read_to_string(&cd_path).unwrap_or_default();
+    assert!(
+        !cd_content.trim().is_empty(),
+        "foreground hook running `wt switch --create` should write a path to \
+         the CD directive file, got: {cd_content:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("shell integration"),
+        "inner wt should not warn about shell integration being uninstalled, got: {stderr}",
+    );
+}
+
+// ============================================================================
+// Pre-* Pipeline Concurrent Execution Tests
+// ============================================================================
+
+/// Pipeline blocks in pre-* hooks run their concurrent commands concurrently.
+/// The second block has two commands — both should produce output with prefixed
+/// labels (the concurrent execution style).
+#[rstest]
+fn test_pre_merge_pipeline_concurrent_block(repo: TestRepo) {
+    repo.write_project_config(
+        r#"[[pre-merge]]
+setup = "echo SETUP"
+
+[[pre-merge]]
+lint = "echo LINT"
+test = "echo TEST"
+"#,
+    );
+    repo.commit("Add pipeline pre-merge hooks");
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["hook", "pre-merge", "--yes"]);
+    let output = cmd.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "pre-merge pipeline should succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // All three commands should have run.
+    assert!(stderr.contains("SETUP"), "setup step should run: {stderr}");
+    assert!(stderr.contains("LINT"), "lint command should run: {stderr}");
+    assert!(stderr.contains("TEST"), "test command should run: {stderr}");
+
+    // Concurrent commands get prefixed labels (e.g., "lint │ LINT").
+    // Serial commands do not. The "│" separator confirms the concurrent path.
+    assert!(
+        stderr.contains("│ LINT") && stderr.contains("│ TEST"),
+        "concurrent block commands should have prefixed labels: {stderr}",
+    );
+}
+
+/// Table form (`[pre-merge]` with multiple keys) runs commands concurrently,
+/// like every other multi-key step — `[pre-merge]` and a single `[[pre-merge]]`
+/// block parse to the same `Concurrent` step.
+#[rstest]
+fn test_pre_merge_table_form_runs_concurrently(repo: TestRepo) {
+    repo.write_project_config(
+        r#"[pre-merge]
+lint = "echo LINT"
+test = "echo TEST"
+"#,
+    );
+    repo.commit("Add table-form pre-merge hooks");
+
+    let mut cmd = repo.wt_command();
+    cmd.args(["hook", "pre-merge", "--yes"]);
+    let output = cmd.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "pre-merge table form should succeed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Concurrent commands get prefixed labels (e.g., "lint │ LINT").
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("│ LINT") && stderr.contains("│ TEST"),
+        "table-form commands should run concurrently (prefixed labels): {stderr}",
+    );
+}
+
+/// Under `-v`, hooks print a grouped table of resolved template variables —
+/// see issue #2309 for why this helps users understand scope-dependent gaps.
+#[rstest]
+fn test_hook_verbose_prints_variable_table(mut repo: TestRepo) {
+    repo.add_worktree("feature");
+    repo.write_test_config(
+        r#"[pre-switch]
+noop = "true"
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd =
+            make_snapshot_cmd_with_global_flags(&repo, "switch", &["feature"], None, &["-v"]);
+        assert_cmd_snapshot!("hook_verbose_variable_table", cmd);
+    });
+}
+
+/// Background-path variable dump dedups per hook type when both user and
+/// project configs contribute to the same hook — the table prints once, not
+/// once per source. Also exercises the `PreparedStep::Single` arm of
+/// `print_background_variable_tables`, which the all-named-commands case in
+/// `test_post_start_verbose_shows_per_hook_output` doesn't hit.
+#[rstest]
+fn test_hook_verbose_background_dedups_across_sources(repo: TestRepo) {
+    repo.write_test_config(r#"post-start = "echo user-hook""#);
+    repo.write_project_config(r#"post-start = "echo project-hook""#);
+    repo.commit("add post-start");
+    repo.write_test_approvals(
+        r#"[projects."../origin"]
+approved-commands = ["echo project-hook"]
+"#,
+    );
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = make_snapshot_cmd_with_global_flags(
+            &repo,
+            "switch",
+            &["--create", "feature"],
+            None,
+            &["-v"],
+        );
+        assert_cmd_snapshot!("hook_verbose_background_dedup", cmd);
+    });
+}
+
+// ============================================================================
+// Docs-page example snapshot
+//
+// See tests/integration_tests/merge.rs header comment for the docs-example
+// convention — `<!-- wt hook pre-merge (docs-example) -->` in `src/cli/mod.rs`.
+// ============================================================================
+
+/// `wt hook pre-merge` example for `docs/src/content/docs/hook.md` — two named
+/// pre-merge hooks (test, lint) running mocked `cargo` commands.
+#[rstest]
+fn test_docs_hook_pre_merge(repo: TestRepo) {
+    repo.run_git(&["config", "worktrunk.hints.worktree-path", "true"]);
+
+    let bin_dir = repo.root_path().join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    crate::common::mock_commands::create_mock_cargo(&bin_dir);
+
+    repo.write_project_config(
+        r#"[[pre-merge]]
+test = "cargo test"
+
+[[pre-merge]]
+lint = "cargo clippy"
+"#,
+    );
+    repo.run_git(&["add", ".config", ".bin"]);
+    repo.run_git(&["commit", "-m", "Add project config"]);
+
+    let mut paths: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    paths.insert(0, bin_dir.clone());
+    let new_path = std::env::join_paths(&paths).unwrap();
+    let bin_dir_str = bin_dir.to_string_lossy().into_owned();
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!("docs_hook_pre_merge", {
+            let mut cmd = make_snapshot_cmd(&repo, "hook", &["pre-merge", "--yes"], None);
+            cmd.env("PATH", &new_path);
+            cmd.env("WORKTRUNK_TEST_MOCK_CONFIG_DIR", &bin_dir_str);
+            cmd
+        });
+    });
+}
+
+// ============================================================================
+// Git-discovery env scrubbing (issue #3373)
+// ============================================================================
+//
+// wt forwards inherited `GIT_*` discovery vars (GIT_DIR, GIT_WORK_TREE, …)
+// into the commands it spawns. For wt's own internal git plumbing that is
+// intentional (#1914), but a *user hook* is meant to operate on the worktree
+// wt sets as its cwd — so a hook that shells out to `git` must discover the
+// repo from that cwd, not from a `GIT_DIR`/`GIT_WORK_TREE` wt happened to
+// inherit (e.g. wt run as a `!wt` git alias, or nested under another tool's
+// git hook). The concrete harm: with both `GIT_DIR` and `GIT_WORK_TREE`
+// present, a hook that runs `git init` (common in test-harness fixtures)
+// writes `core.worktree` into the inherited repo's config, silently
+// redirecting every later plain git command in that repo.
+//
+// These tests set a git-discovery context that is *consistent* with the repo
+// wt operates on (GIT_DIR = repo's gitdir, GIT_WORK_TREE = repo root), so wt
+// itself runs normally, then assert the spawned hook does not see the vars.
+// The hook records `$GIT_DIR`/`$GIT_WORK_TREE` — empty once scrubbed — as
+// `[<git_dir>][<work_tree>]`; a fully-scrubbed environment yields `[][]`.
+
+/// Hook body recording the `GIT_DIR`/`GIT_WORK_TREE` it sees to `marker`.
+/// Unset vars expand to empty, so a scrubbed environment writes `[][]`.
+fn record_git_env_cmd(marker: &str) -> String {
+    format!(r#"printf '[%s][%s]' \"$GIT_DIR\" \"$GIT_WORK_TREE\" > {marker}"#)
+}
+
+/// Assert a `record_git_env_cmd` marker shows both discovery vars scrubbed.
+fn assert_git_env_scrubbed(marker: &std::path::Path) {
+    let seen = fs::read_to_string(marker).unwrap();
+    assert_eq!(
+        seen, "[][]",
+        "hook inherited git-discovery vars ([GIT_DIR][GIT_WORK_TREE]): {seen}"
+    );
+}
+
+/// Run `wt hook <args>` with an inherited (but repo-consistent) git-discovery
+/// context, matching what a `!wt` git alias leaves in the environment.
+fn run_hook_with_inherited_git_env(repo: &TestRepo, args: &[&str]) -> std::process::Output {
+    repo.wt_command()
+        .args(args)
+        .env("GIT_DIR", repo.root_path().join(".git"))
+        .env("GIT_WORK_TREE", repo.root_path())
+        .output()
+        .unwrap()
+}
+
+#[rstest]
+fn test_foreground_hook_does_not_inherit_git_discovery_vars(repo: TestRepo) {
+    repo.write_test_config(&format!(
+        "[pre-merge]\nrecord = \"{}\"\n",
+        record_git_env_cmd("env_seen.txt")
+    ));
+
+    let output = run_hook_with_inherited_git_env(&repo, &["hook", "pre-merge", "--yes"]);
+    assert!(
+        output.status.success(),
+        "pre-merge hook run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let marker = repo.root_path().join("env_seen.txt");
+    assert!(marker.exists(), "foreground hook did not run");
+    assert_git_env_scrubbed(&marker);
+}
+
+#[rstest]
+fn test_background_hook_does_not_inherit_git_discovery_vars(repo: TestRepo) {
+    repo.write_test_config(&format!(
+        "[post-merge]\nrecord = \"{}\"\n",
+        record_git_env_cmd("env_seen.txt")
+    ));
+
+    let output = run_hook_with_inherited_git_env(&repo, &["hook", "post-merge", "--yes"]);
+    assert!(
+        output.status.success(),
+        "post-merge hook dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // post-* hooks run detached; poll for the marker before reading it.
+    let marker = repo.root_path().join("env_seen.txt");
+    wait_for_file_content(&marker);
+    assert_git_env_scrubbed(&marker);
+}
+
+#[rstest]
+fn test_concurrent_hook_does_not_inherit_git_discovery_vars(repo: TestRepo) {
+    // A multi-command hook table runs as a concurrent group (foreground for a
+    // pre-* hook), exercising the separate concurrent spawn path.
+    repo.write_test_config(&format!(
+        "[pre-merge]\nrecord = \"{}\"\nnoop = \"true\"\n",
+        record_git_env_cmd("env_seen.txt")
+    ));
+
+    let output = run_hook_with_inherited_git_env(&repo, &["hook", "pre-merge", "--yes"]);
+    assert!(
+        output.status.success(),
+        "concurrent pre-merge hook run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let marker = repo.root_path().join("env_seen.txt");
+    assert!(marker.exists(), "concurrent hook did not run");
+    assert_git_env_scrubbed(&marker);
+}
+
+/// A serial project hook and a concurrent user hook share status and source grammar.
+#[rstest]
+#[case(false, "project")]
+#[case(true, "user")]
+fn test_hook_failure_status_and_source(
+    repo: TestRepo,
+    #[case] concurrent: bool,
+    #[case] source: &str,
+) {
+    let config = if concurrent {
+        r#"pre-merge = [{ check = "exit 7", sibling = "true" }]"#
+    } else {
+        r#"pre-merge = [{ check = "exit 7" }]"#
+    };
+    if source == "project" {
+        repo.write_project_config(config);
+    } else {
+        repo.write_test_config(config);
+    }
+    let output = repo
+        .wt_command()
+        .args(["hook", "pre-merge", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(format!("hook_failure_status_{source}"), stderr);
+    });
+}
+
+/// A hook moves its worktree, so the next spawn fails. Serial and concurrent
+/// paths retain the failing command and OS cause under Warn and FailFast.
+#[rstest]
+#[cfg(unix)]
+#[case::warn_serial(true, false)]
+#[case::warn_concurrent(true, true)]
+#[case::failfast_serial(false, false)]
+#[case::failfast_concurrent(false, true)]
+fn test_foreground_hook_spawn_failure_has_one_io_detail(
+    mut repo: TestRepo,
+    #[case] warn: bool,
+    #[case] concurrent: bool,
+) {
+    let worktree = repo.add_worktree("move-away");
+    let hook = if warn { "post-start" } else { "pre-merge" };
+    let config = if concurrent {
+        r#"[
+    { move = "mv {{ worktree_path }} {{ worktree_path }}.moved" },
+    { check = "true", sibling = "true" },
+]
+"#
+    } else {
+        r#"[
+    { move = "mv {{ worktree_path }} {{ worktree_path }}.moved" },
+    { check = "true" },
+]
+"#
+    };
+    repo.write_test_config(&format!("{hook} = {config}"));
+    let output = repo
+        .wt_command()
+        .args(["hook", hook, "--foreground", "--yes"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if warn { 0 } else { 1 }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !worktree.exists(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(worktree.with_file_name("repo.move-away.moved").exists());
+    assert!(repo.root_path().exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("Failed to execute").count(),
+        if warn && concurrent { 2 } else { 1 },
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("os error 2").count(),
+        if warn && concurrent { 2 } else { 1 },
+        "{stderr}"
+    );
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(
+            match (warn, concurrent) {
+                (true, false) => "foreground_hook_spawn_failure_has_one_io_detail",
+                (true, true) => "foreground_concurrent_hook_spawn_failure_has_one_io_detail",
+                (false, false) => "foreground_hook_failfast_spawn_failure_has_one_io_detail",
+                (false, true) =>
+                    "foreground_concurrent_hook_failfast_spawn_failure_has_one_io_detail",
+            },
+            stderr
+        );
+    });
+}
+
+/// Sibling count must not change access to /dev/tty. Exercise the reported
+/// terminal-settings failure, input allocation, and restoration after the job.
+#[rstest]
+#[cfg(all(unix, feature = "shell-integration-tests"))]
+#[case::single(false)]
+#[case::concurrent(true)]
+fn test_foreground_hook_terminal_job(repo: TestRepo, #[case] concurrent: bool) {
+    use crate::common::{configure_pty_command, open_pty, wt_bin};
+    use portable_pty::CommandBuilder;
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let probe = "stty -echo < /dev/tty; ps -o pgid= -p $$ > job.txt; ps -o tpgid= -p $$ >> job.txt; stty \"$WT_TEST_TERMINAL_MODES\" < /dev/tty";
+    let input = if concurrent {
+        "test ! -t 0"
+    } else {
+        "test -t 0"
+    };
+    let config = if concurrent {
+        format!(
+            "[pre-start]\none = '{probe}; {input}'\ntwo = 'stty -echo < /dev/tty; test ! -t 0; ps -o pgid= -p $$ > sibling.txt; stty \"$WT_TEST_TERMINAL_MODES\" < /dev/tty'\n"
+        )
+    } else {
+        format!("pre-start = '{probe}; {input}'\n")
+    };
+    repo.write_project_config(&config);
+    let mut command = CommandBuilder::new("bash");
+    command.args([
+        "--noprofile",
+        "--norc",
+        "-c",
+        r#"
+before=$(stty -g)
+export WT_TEST_TERMINAL_MODES="$before"
+"$WT_JOB_TEST_BINARY" hook pre-start --yes
+result=$?
+after=$(stty -g)
+[ "$before" = "$after" ] || exit 99
+printf 'TERMINAL-RESTORED\n'
+exit "$result"
+"#,
+    ]);
+    configure_pty_command(&mut command);
+    command.cwd(repo.root_path());
+    command.env("WT_JOB_TEST_BINARY", wt_bin());
+    command.env("WORKTRUNK_CONFIG_PATH", repo.test_config_path());
+    let pair = open_pty();
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = reader.read_to_end(&mut output);
+        let _ = tx.send(String::from_utf8_lossy(&output).into_owned());
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            if let Some(group) = pair.master.process_group_leader() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            panic!("foreground hook stopped or hung (concurrent={concurrent})");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(pair.master);
+    let output = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    reading.join().unwrap();
+    assert_eq!(status.exit_code(), 0, "{output}");
+    assert!(output.contains("TERMINAL-RESTORED"), "{output}");
+    let groups: Vec<i32> = fs::read_to_string(repo.root_path().join("job.txt"))
+        .unwrap()
+        .split_whitespace()
+        .map(|group| group.parse().unwrap())
+        .collect();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups[0], groups[1],
+        "child must own the terminal's foreground group"
+    );
+    if concurrent {
+        let sibling: i32 = fs::read_to_string(repo.root_path().join("sibling.txt"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sibling, groups[0],
+            "siblings must share one foreground job group"
+        );
+    }
+}

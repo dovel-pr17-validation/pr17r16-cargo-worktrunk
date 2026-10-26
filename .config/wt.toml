@@ -1,0 +1,44 @@
+[[post-start]]
+# Copy target/ from main worktree using CoW (~3s vs ~68s full rebuild)
+deps = "wt step copy-ignored"
+assets = "task fetch-assets"
+
+# Restore any packages copy-ignored could not share. The common case uses the
+# local npm cache and finishes without reaching the network.
+[[post-start]]
+docs-install = "npm --prefix docs install --prefer-offline --no-audit --no-fund"
+
+# Astro's dev server runs forever; tether kills its whole process tree when the
+# worktree is removed (any path — `wt remove`, `git worktree remove`, `rm -rf`),
+# so no `pre-remove`/`post-remove` cleanup is needed. The worktree root is still
+# what teardown watches even though the server runs from `docs/`.
+# When `astro dev` detects an AI agent (`CLAUDECODE`, `CODEX_THREAD_ID`, …), it
+# respawns itself as a detached process, which tether can't reach and which
+# drops `--force`. `ASTRO_DEV_BACKGROUND=1`, the variable Astro sets on that
+# respawned child, keeps the server in the foreground.
+[[post-start]]
+docs = "ASTRO_DEV_BACKGROUND=1 wt step tether -C docs -- npm run dev -- --host 127.0.0.1 --port {{ branch | hash_port }}"
+
+[post-merge]
+clippy = "pre-commit run clippy --all-files || true"
+# Warms the cache the pre-merge `insta` gate reuses, so RUSTFLAGS and the
+# feature set must match that line: cargo fingerprints both, and a mismatch in
+# either leaves the gate rebuilding artifacts it can't reuse.
+build = "RUSTFLAGS='-D warnings' cargo test --no-run --locked --all-targets --all-features"
+install = "cargo install --path ."
+sync = 'if [ "{{ target }}" = "main" ]; then git pull && git push; fi'
+
+[[pre-merge]]
+# Assert Cargo.lock is in sync with Cargo.toml before anything builds. Must be
+# first: a preceding unlocked cargo command (the insta hook's test runner, or a
+# pre-commit hook) would silently regenerate a stale lock and mask this check.
+# `--workspace` reconciles the lock against the manifests only; plain
+# `cargo update --locked` would also fail on dependencies merely behind latest.
+lockfile = "cargo update --workspace --locked"
+pre-commit = "pre-commit run --all-files"
+insta = """RUSTFLAGS='-D warnings' cargo insta test --test-runner nextest --dnd --check $([ "$(uname)" = 'Linux' ] && echo '--unreferenced reject') --all-features"""
+doctest = "RUSTDOCFLAGS='-Dwarnings' cargo test --doc"
+doc = "RUSTDOCFLAGS='-Dwarnings' cargo doc --no-deps --document-private-items"
+
+[list]
+url = "http://127.0.0.1:{{ branch | hash_port }}"
